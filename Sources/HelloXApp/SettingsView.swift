@@ -297,10 +297,10 @@ struct SettingsView: View {
 
             HelloXSection(title: "项目链接", showsBorder: false) {
                 HStack(spacing: 22) {
-                    Link(destination: URL(string: "https://github.com/HelloX/HelloX")!) {
+                    Link(destination: URL(string: "https://github.com/HelloX-ZhaoWen/hellox")!) {
                         HStack(spacing: 7) { HelloXIcon(icon: .link, size: 15); Text("项目主页") }
                     }
-                    Link(destination: URL(string: "https://github.com/HelloX/HelloX#隐私与数据")!) {
+                    Link(destination: URL(string: "https://github.com/HelloX-ZhaoWen/hellox#隐私与数据")!) {
                         HStack(spacing: 7) { HelloXIcon(icon: .privacy, size: 15); Text("隐私说明") }
                     }
                 }

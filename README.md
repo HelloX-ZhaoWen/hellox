@@ -27,7 +27,7 @@ HelloX 是一款原生 macOS 菜单栏应用，覆盖截图、滚动长截图、
 
 ## 安装
 
-从 [GitHub Releases](https://github.com/HelloX/HelloX/releases) 下载最新 DMG，打开后运行其中的安装包。
+从 [GitHub Releases](https://github.com/HelloX-ZhaoWen/hellox/releases) 下载最新 DMG，打开后运行其中的安装包。
 
 首次使用相关功能时，macOS 可能请求以下权限：
 
@@ -51,7 +51,7 @@ HelloX 是一款原生 macOS 菜单栏应用，覆盖截图、滚动长截图、
 开发环境需要 macOS 15 SDK、Swift 6 和完整 Xcode 工具链。
 
 ```sh
-git clone https://github.com/HelloX/HelloX.git
+git clone https://github.com/HelloX-ZhaoWen/hellox.git
 cd HelloX
 swift build
 Scripts/build-app.sh

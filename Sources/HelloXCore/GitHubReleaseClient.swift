@@ -99,7 +99,7 @@ public enum AppUpdateError: LocalizedError, Equatable, Sendable {
 }
 
 public final class GitHubReleaseClient: @unchecked Sendable {
-    public static let defaultRepository = "HelloX/HelloX"
+    public static let defaultRepository = "HelloX-ZhaoWen/hellox"
 
     private let repository: String
     private let session: URLSession
