@@ -1,0 +1,7 @@
+"app.name" = "HelloX";
+"capture.region" = "区域截图";
+"capture.window" = "窗口截图";
+"capture.fullScreen" = "全屏截图";
+"capture.scrolling" = "滚动长截图";
+"permission.screenRecording" = "屏幕录制权限";
+"permission.accessibility" = "辅助功能权限";

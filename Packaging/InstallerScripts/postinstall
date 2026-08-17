@@ -1,0 +1,9 @@
+#!/bin/zsh
+set -eu
+
+APP=/Applications/HelloX.app
+LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+[[ -d "$APP" ]] && "$LSREGISTER" -f "$APP" >/dev/null 2>&1 || true
+/usr/bin/touch "$APP" >/dev/null 2>&1 || true
+
+exit 0

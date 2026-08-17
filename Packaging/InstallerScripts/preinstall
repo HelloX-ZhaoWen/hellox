@@ -1,0 +1,7 @@
+#!/bin/zsh
+set -eu
+
+/usr/bin/pkill -x HelloX >/dev/null 2>&1 || true
+[[ -e /Applications/HelloX.app || -L /Applications/HelloX.app ]] && /bin/rm -rf /Applications/HelloX.app
+
+exit 0
