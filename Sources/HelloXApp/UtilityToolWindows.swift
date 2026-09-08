@@ -7,17 +7,36 @@ import WebKit
 final class UtilityToolWindowController: NSWindowController, NSWindowDelegate {
     let tool: UtilityTool
     private let markdownOpenRouter: MarkdownOpenRouter
+    private let colorPickerModel: ColorPickerToolModel?
 
     init(tool: UtilityTool) {
         self.tool = tool
         let markdownOpenRouter = MarkdownOpenRouter()
+        let colorPickerModel = tool == .colorPicker ? ColorPickerToolModel() : nil
         self.markdownOpenRouter = markdownOpenRouter
-        let minimumSize = tool == .markdown
-            ? NSSize(width: 900, height: 640)
-            : NSSize(width: 700, height: 520)
-        let initialSize = tool == .markdown
-            ? NSSize(width: 1180, height: 780)
-            : minimumSize
+        self.colorPickerModel = colorPickerModel
+        let minimumSize: NSSize
+        let initialSize: NSSize
+        switch tool {
+        case .markdown:
+            minimumSize = NSSize(width: 900, height: 580)
+            initialSize = NSSize(width: 1200, height: 800)
+        case .colorPicker:
+            minimumSize = NSSize(width: 380, height: 320)
+            initialSize = NSSize(width: 380, height: 320)
+        case .csvToExcel:
+            minimumSize = NSSize(width: 560, height: 320)
+            initialSize = NSSize(width: 600, height: 340)
+        case .base64:
+            minimumSize = NSSize(width: 700, height: 440)
+            initialSize = NSSize(width: 760, height: 520)
+        case .qrCode:
+            minimumSize = NSSize(width: 560, height: 320)
+            initialSize = NSSize(width: 620, height: 340)
+        case .password:
+            minimumSize = NSSize(width: 600, height: 300)
+            initialSize = NSSize(width: 640, height: 300)
+        }
         let window = HelloXWindow(
             contentRect: NSRect(origin: .zero, size: initialSize),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
@@ -28,13 +47,29 @@ final class UtilityToolWindowController: NSWindowController, NSWindowDelegate {
         window.minSize = minimumSize
         window.isReleasedWhenClosed = false
         window.collectionBehavior = [.moveToActiveSpace]
+        if tool == .markdown {
+            window.collectionBehavior.insert(.fullScreenPrimary)
+        }
         window.tabbingMode = .disallowed
         window.center()
-        window.contentViewController = NSHostingController(rootView: UtilityToolRootView(
-            tool: tool,
-            markdownOpenRouter: markdownOpenRouter
-        ))
-        HelloXWindowStyle.apply(to: window, movableByBackground: false)
+        window.contentViewController = HXDialogHostingController(
+            rootView: HXDialogWindowContent(usesNativeWindowControls: tool == .markdown,
+                                           title: tool.title, subtitle: tool.dialogSubtitle,
+                                           onClose: { [weak window] in window?.performClose(nil) }) {
+                UtilityToolRootView(tool: tool, markdownOpenRouter: markdownOpenRouter, colorPickerModel: colorPickerModel)
+            }, minimumSize: minimumSize
+        )
+        HelloXWindowStyle.applyDialog(to: window)
+        if tool == .markdown {
+            window.isMovableByWindowBackground = false
+            for type in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+                window.standardWindowButton(type)?.isHidden = false
+            }
+            DispatchQueue.main.async { [weak window] in
+                guard let window else { return }
+                HelloXWindowStyle.positionSettingsWindowControls(in: window, topInset: 26)
+            }
+        }
         window.setContentSize(initialSize)
         super.init(window: window)
         window.delegate = self
@@ -45,6 +80,7 @@ final class UtilityToolWindowController: NSWindowController, NSWindowDelegate {
 
     func present() {
         if let window,
+           !window.styleMask.contains(.fullScreen),
            let screen = NSScreen.screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) }) ?? NSScreen.main {
             window.setFrameOrigin(NSPoint(
                 x: screen.visibleFrame.midX - window.frame.width / 2,
@@ -54,12 +90,30 @@ final class UtilityToolWindowController: NSWindowController, NSWindowDelegate {
         NSApp.activate(ignoringOtherApps: true)
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
+        colorPickerModel?.beginSampling()
     }
 
     func openMarkdownDocuments(at urls: [URL]) {
         guard tool == .markdown else { return }
         markdownOpenRouter.open(urls)
         present()
+    }
+
+    func windowDidResize(_ notification: Notification) {
+        guard tool == .markdown, let window, !window.styleMask.contains(.fullScreen) else { return }
+        HelloXWindowStyle.positionSettingsWindowControls(in: window, topInset: 26)
+    }
+
+    func windowDidExitFullScreen(_ notification: Notification) {
+        guard tool == .markdown else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let window = self?.window else { return }
+            HelloXWindowStyle.positionSettingsWindowControls(in: window, topInset: 26)
+        }
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        colorPickerModel?.cancelSampling()
     }
 }
 
@@ -84,8 +138,9 @@ final class QRCodeResultWindowController: NSWindowController, NSWindowDelegate {
     var onClose: (() -> Void)?
 
     init(values: [String]) {
+        let initialSize = NSSize(width: 580, height: min(520, 140 + CGFloat(max(1, values.count)) * 70))
         let window = HelloXWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 580, height: 420),
+            contentRect: NSRect(origin: .zero, size: initialSize),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
@@ -95,9 +150,14 @@ final class QRCodeResultWindowController: NSWindowController, NSWindowDelegate {
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         window.hidesOnDeactivate = false
         window.isReleasedWhenClosed = false
-        window.minSize = NSSize(width: 460, height: 320)
-        window.contentViewController = NSHostingController(rootView: QRCodeResultWindowView(values: values))
-        HelloXWindowStyle.apply(to: window, movableByBackground: false)
+        window.minSize = NSSize(width: 460, height: 200)
+        window.contentViewController = HXDialogHostingController(
+            rootView: HXDialogWindowContent(title: "二维码识别结果", onClose: { [weak window] in window?.performClose(nil) }) {
+                QRCodeResultWindowView(values: values)
+            }, minimumSize: NSSize(width: 460, height: 200)
+        )
+        HelloXWindowStyle.applyDialog(to: window)
+        window.setContentSize(initialSize)
         super.init(window: window)
         window.delegate = self
         window.center()
@@ -107,7 +167,11 @@ final class QRCodeResultWindowController: NSWindowController, NSWindowDelegate {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     func update(values: [String]) {
-        window?.contentViewController = NSHostingController(rootView: QRCodeResultWindowView(values: values))
+        window?.contentViewController = HXDialogHostingController(
+            rootView: HXDialogWindowContent(title: "二维码识别结果", onClose: { [weak window] in window?.performClose(nil) }) {
+                QRCodeResultWindowView(values: values)
+            }, minimumSize: NSSize(width: 460, height: 200)
+        )
         present()
     }
 
@@ -126,18 +190,13 @@ private struct QRCodeResultWindowView: View {
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
-        ZStack {
-            HelloXGlowBackground().ignoresSafeArea()
-            VStack(alignment: .leading, spacing: 16) {
+        ZStack(alignment: .topLeading) {
+            HXDialogStyle.background(colorScheme).ignoresSafeArea()
+            VStack(alignment: .leading, spacing: 12) {
                 HStack(spacing: 12) {
-                    HelloXRowIcon(icon: .qrCode, size: 42)
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("二维码识别结果")
-                            .font(.system(size: 18, weight: .bold))
-                        Text("共识别到 \(values.count) 条内容")
-                            .font(.system(size: 11))
-                            .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
-                    }
+                    Text("共识别到 \(values.count) 条内容")
+                        .font(HXTypography.caption)
+                        .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
                     Spacer()
                     HelloXUtilityTextButton(title: "复制全部", help: "复制全部") {
                         _ = UtilityClipboard.copy(values.joined(separator: "\n"))
@@ -150,14 +209,15 @@ private struct QRCodeResultWindowView: View {
                             HelloXCard(padding: 14) {
                                 HStack(alignment: .top, spacing: 12) {
                                     Text("\(index + 1)")
-                                        .font(.system(size: 11, weight: .bold, design: .monospaced))
-                                        .foregroundStyle(HelloXTheme.accent)
+                                        .font(HXTypography.section).monospacedDigit()
+                                        .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
                                         .frame(width: 24, height: 24)
-                                        .background(HelloXTheme.accent.opacity(0.10), in: Circle())
+                                        .background(HelloXTheme.controlBackground(for: colorScheme), in: Circle())
                                     Text(value)
                                         .font(.system(size: 13, design: .monospaced))
                                         .textSelection(.enabled)
                                         .frame(maxWidth: .infinity, alignment: .leading)
+                                        .fixedSize(horizontal: false, vertical: true)
                                     if let url = QRCodePayload.webURL(from: value) {
                                         HelloXUtilityTextButton(title: "打开网址", help: "打开网址") {
                                             NSWorkspace.shared.open(url)
@@ -173,9 +233,13 @@ private struct QRCodeResultWindowView: View {
                 }
                 .scrollContentBackground(.hidden)
                 .seamlessScrollChrome()
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
-            .padding(24)
+            .padding(.horizontal, 20)
+            .padding(.bottom, 20)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
+        .font(HXTypography.body)
         .tint(HelloXTheme.accent)
     }
 }
@@ -183,6 +247,7 @@ private struct QRCodeResultWindowView: View {
 private struct UtilityToolRootView: View {
     let tool: UtilityTool
     @ObservedObject var markdownOpenRouter: MarkdownOpenRouter
+    let colorPickerModel: ColorPickerToolModel?
 
     @ViewBuilder
     var body: some View {
@@ -190,6 +255,10 @@ private struct UtilityToolRootView: View {
         case .csvToExcel: CSVExcelToolView()
         case .base64: Base64ToolView()
         case .qrCode: QRCodeToolView()
+        case .colorPicker:
+            if let colorPickerModel {
+                ColorPickerToolView(model: colorPickerModel)
+            }
         case .password: PasswordToolView()
         case .markdown: MarkdownToolView(openRouter: markdownOpenRouter)
         }
@@ -197,35 +266,17 @@ private struct UtilityToolRootView: View {
 }
 
 private struct UtilityToolShell<Content: View>: View {
-    let tool: UtilityTool
-    let subtitle: String
     @ViewBuilder let content: Content
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
-        ZStack {
-            HelloXGlowBackground().ignoresSafeArea()
-            VStack(alignment: .leading, spacing: 18) {
-                HStack(spacing: 13) {
-                    HelloXRowIcon(icon: tool.icon, size: 44)
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(tool.title)
-                            .font(.system(size: 18, weight: .bold))
-                            .foregroundStyle(HelloXTheme.primaryText(for: colorScheme))
-                        Text(subtitle)
-                            .font(.system(size: 12))
-                            .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
-                    }
-                }
-                content
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
-            .padding(.horizontal, 28)
-            .padding(.top, 28)
-            .padding(.bottom, 26)
-        }
-        .frame(minWidth: 680, minHeight: 500)
-        .tint(HelloXTheme.accent)
+        content
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .padding(.horizontal, 20)
+            .padding(.bottom, 20)
+            .background(HXDialogStyle.background(colorScheme))
+            .font(HXTypography.body)
+            .tint(HelloXTheme.accent)
     }
 }
 
@@ -238,20 +289,20 @@ private struct CSVExcelToolView: View {
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
-        UtilityToolShell(tool: .csvToExcel, subtitle: "将 CSV 表格转换为可在 Excel 中打开的 .xlsx 文件") {
+        UtilityToolShell {
             VStack(spacing: 16) {
                 Button(action: chooseCSV) {
                     VStack(spacing: 13) {
-                        HelloXIcon(icon: .save, size: 28)
-                            .foregroundStyle(HelloXTheme.accent)
+                        HelloXIcon(icon: .upload, size: 24)
+                            .foregroundStyle(HelloXTheme.iconForeground(for: colorScheme))
                         Text(isDropTargeted ? "松开即可选择 CSV" : "点击或拖拽 CSV 文件到这里")
-                            .font(.system(size: 15, weight: .semibold))
+                            .font(HXTypography.section)
                         Text(sourceURL?.lastPathComponent ?? "支持 UTF-8、UTF-16 编码及带引号的 CSV")
-                            .font(.system(size: 11))
+                            .font(HXTypography.caption)
                             .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
                             .lineLimit(1)
                     }
-                    .frame(maxWidth: .infinity, minHeight: 230)
+                    .frame(maxWidth: .infinity, minHeight: 160, maxHeight: .infinity)
                     .background(HelloXTheme.raisedSurface(for: colorScheme), in: RoundedRectangle(cornerRadius: HelloXTheme.cardRadius))
                     .overlay {
                         RoundedRectangle(cornerRadius: HelloXTheme.cardRadius)
@@ -270,7 +321,7 @@ private struct CSVExcelToolView: View {
                 HStack {
                     if !message.isEmpty {
                         Text(message)
-                            .font(.system(size: 12, weight: .medium))
+                            .font(HXTypography.caption)
                             .foregroundStyle(failed ? HelloXTheme.error : HelloXTheme.success)
                     }
                     Spacer()
@@ -322,10 +373,9 @@ private struct CSVExcelToolView: View {
     }
 }
 
-private enum Base64Direction: String, CaseIterable, Identifiable {
-    case encode = "编码"
-    case decode = "解码"
-    var id: String { rawValue }
+private enum Base64Direction {
+    case encode
+    case decode
 }
 
 private struct Base64ToolView: View {
@@ -333,27 +383,34 @@ private struct Base64ToolView: View {
     @State private var input = ""
     @State private var output = ""
     @State private var errorMessage = ""
+    @State private var isSwapHovered = false
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
-        UtilityToolShell(tool: .base64, subtitle: "在普通文本与 Base64 文本之间转换") {
+        UtilityToolShell {
             VStack(spacing: 14) {
-                Picker("转换方式", selection: $direction) {
-                    ForEach(Base64Direction.allCases) { Text($0.rawValue).tag($0) }
-                }
-                .pickerStyle(.menu)
-                .buttonStyle(.borderless)
-                .frame(width: 260)
-
                 HStack(spacing: 14) {
-                    editor(title: direction == .encode ? "原始文本" : "Base64", text: $input)
-                    HelloXIcon(icon: .arrowRight, size: 18).foregroundStyle(HelloXTheme.accent)
-                    editor(title: "转换结果", text: $output)
+                    editor(title: direction == .encode ? "文本" : "Base64", text: $input)
+                    Button(action: swapDirection) {
+                        Image(systemName: "arrow.left.arrow.right")
+                            .font(.system(size: 16, weight: .medium))
+                            .foregroundStyle(HelloXTheme.iconForeground(for: colorScheme))
+                            .frame(width: 32, height: 32)
+                            .background(isSwapHovered ? HelloXTheme.hoverBackground(for: colorScheme) : .clear,
+                                        in: RoundedRectangle(cornerRadius: 8))
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .onHover { isSwapHovered = $0 }
+                    .help("切换文本与 Base64 转换方向")
+                    .accessibilityLabel("切换文本与 Base64 转换方向")
+                    editor(title: direction == .encode ? "Base64" : "文本", text: $output)
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
 
                 HStack {
                     if !errorMessage.isEmpty {
-                        Text(errorMessage).font(.system(size: 11)).foregroundStyle(HelloXTheme.error)
+                        Text(errorMessage).font(HXTypography.caption).foregroundStyle(HelloXTheme.error)
                     }
                     Spacer()
                     HelloXUtilityTextButton(title: "清空", help: "清空", role: .destructive) {
@@ -373,15 +430,23 @@ private struct Base64ToolView: View {
 
     private func editor(title: String, text: Binding<String>) -> some View {
         VStack(alignment: .leading, spacing: 7) {
-            Text(title).font(.system(size: 12, weight: .semibold))
+            Text(title).font(HXTypography.section)
             TextEditor(text: text)
                 .font(.system(size: 13, design: .monospaced))
+                .frame(minHeight: 180, maxHeight: .infinity)
                 .padding(8)
                 .seamlessTextEditorChrome()
                 .scrollContentBackground(.hidden)
                 .background(HelloXTheme.raisedSurface(for: colorScheme), in: RoundedRectangle(cornerRadius: HelloXTheme.controlRadius))
                 .overlay(RoundedRectangle(cornerRadius: HelloXTheme.controlRadius).stroke(HelloXTheme.border(for: colorScheme)))
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private func swapDirection() {
+        direction = direction == .encode ? .decode : .encode
+        (input, output) = (output, input)
+        errorMessage = ""
     }
 
     private func convert() {
@@ -395,7 +460,7 @@ private struct Base64ToolView: View {
     }
 }
 
-private struct QRCodeToolView: View {
+struct QRCodeToolView: View {
     @State private var results: [String] = []
     @State private var selectedName = ""
     @State private var message = ""
@@ -403,19 +468,43 @@ private struct QRCodeToolView: View {
     @State private var isDropTargeted = false
     @Environment(\.colorScheme) private var colorScheme
 
+    init(results: [String] = [], selectedName: String = "") {
+        _results = State(initialValue: results)
+        _selectedName = State(initialValue: selectedName)
+    }
+
     var body: some View {
-        UtilityToolShell(tool: .qrCode, subtitle: "从图片中识别二维码内容") {
+        UtilityToolShell {
             VStack(spacing: 16) {
                 Button(action: chooseImage) {
-                    VStack(spacing: 12) {
-                        HelloXIcon(icon: .textRecognition, size: 32).foregroundStyle(HelloXTheme.accent)
-                        Text(isDropTargeted ? "松开即可识别" : "点击或拖拽二维码图片")
-                            .font(.system(size: 15, weight: .semibold))
-                        Text(selectedName.isEmpty ? "支持 PNG、JPG、HEIC、TIFF" : selectedName)
-                            .font(.system(size: 11))
-                            .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
+                    Group {
+                        if results.isEmpty {
+                            VStack(spacing: 12) {
+                                HelloXIcon(icon: .qrCode, size: 24).foregroundStyle(HelloXTheme.iconForeground(for: colorScheme))
+                                Text(isDropTargeted ? "松开即可识别" : "点击或拖拽二维码图片")
+                                    .font(HXTypography.section)
+                                Text(selectedName.isEmpty ? "支持 PNG、JPG、HEIC、TIFF" : selectedName)
+                                    .font(HXTypography.caption)
+                                    .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
+                            }
+                        } else {
+                            HStack(spacing: 12) {
+                                HelloXIcon(icon: .qrCode, size: 20)
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(isDropTargeted ? "松开即可识别" : "重新选择二维码图片")
+                                        .font(HXTypography.section)
+                                    Text("\(selectedName) · \(results.count) 条结果")
+                                        .font(HXTypography.caption)
+                                        .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
+                                        .lineLimit(1).truncationMode(.middle)
+                                }
+                                Spacer(minLength: 0)
+                            }
+                            .padding(.horizontal, 16)
+                        }
                     }
-                    .frame(maxWidth: .infinity, minHeight: results.isEmpty ? 220 : 150)
+                    .frame(maxWidth: .infinity, minHeight: results.isEmpty ? 160 : 56,
+                           maxHeight: results.isEmpty ? .infinity : nil)
                     .background(HelloXTheme.raisedSurface(for: colorScheme), in: RoundedRectangle(cornerRadius: HelloXTheme.cardRadius))
                     .overlay {
                         RoundedRectangle(cornerRadius: HelloXTheme.cardRadius)
@@ -430,22 +519,30 @@ private struct QRCodeToolView: View {
                 } isTargeted: { isDropTargeted = $0 }
 
                 if !results.isEmpty {
-                    HelloXCard {
-                        VStack(alignment: .leading, spacing: 10) {
-                            Text("识别结果").font(.system(size: 13, weight: .bold))
-                            ForEach(Array(results.enumerated()), id: \.offset) { _, value in
-                                HStack {
-                                    Text(value).font(.system(size: 13, design: .monospaced)).textSelection(.enabled)
-                                    Spacer()
-                                    HelloXUtilityTextButton(title: "复制", help: "复制") {
-                                        _ = UtilityClipboard.copy(value)
+                    ScrollView {
+                        HelloXCard {
+                            VStack(alignment: .leading, spacing: 10) {
+                                Text("识别结果").font(HXTypography.section)
+                                ForEach(Array(results.enumerated()), id: \.offset) { _, value in
+                                    HStack(alignment: .top) {
+                                        Text(value)
+                                            .font(.system(size: 13, design: .monospaced))
+                                            .textSelection(.enabled)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                        HelloXUtilityTextButton(title: "复制", help: "复制") {
+                                            _ = UtilityClipboard.copy(value)
+                                        }
                                     }
                                 }
                             }
                         }
                     }
+                    .frame(maxWidth: .infinity, minHeight: 80, maxHeight: .infinity, alignment: .topLeading)
+                    .scrollContentBackground(.hidden)
+                    .seamlessScrollChrome()
                 }
-                if !message.isEmpty {
+                if !message.isEmpty && (failed || results.isEmpty) {
                     HelloXStatusBanner(message: message, kind: failed ? .error : .success)
                 }
             }
@@ -479,6 +576,196 @@ private struct QRCodeToolView: View {
     }
 }
 
+@MainActor
+private final class ColorPickerToolModel: NSObject, ObservableObject {
+    @Published var color = NSColor(srgbRed: 0.16, green: 0.46, blue: 0.96, alpha: 1)
+    @Published private(set) var isSampling = false
+    private var sampler: NSColorSampler?
+    private var samplingSessionID: UUID?
+    private var adjustmentWell: NSColorWell?
+
+    var code: ColorCode { ColorCode(color: color) }
+
+    func beginSampling() {
+        guard !isSampling else { return }
+        endAdjusting()
+        let sampler = NSColorSampler()
+        let sessionID = UUID()
+        self.sampler = sampler
+        samplingSessionID = sessionID
+        isSampling = true
+        sampler.show { [weak self] sampledColor in
+            guard let self, self.samplingSessionID == sessionID else { return }
+            self.isSampling = false
+            self.sampler = nil
+            self.samplingSessionID = nil
+            if let sampledColor {
+                self.color = sampledColor.usingColorSpace(.sRGB) ?? sampledColor
+            }
+        }
+    }
+
+    func cancelSampling() {
+        endAdjusting()
+        guard isSampling else { return }
+        samplingSessionID = nil
+        sampler = nil
+        isSampling = false
+
+        // NSColorSampler has no public cancellation method. Its native interface
+        // treats Escape as cancellation, so post the same event when the owning
+        // window closes to prevent the sampler from remaining active.
+        let timestamp = ProcessInfo.processInfo.systemUptime
+        for type in [NSEvent.EventType.keyDown, .keyUp] {
+            guard let event = NSEvent.keyEvent(
+                with: type,
+                location: .zero,
+                modifierFlags: [],
+                timestamp: timestamp,
+                windowNumber: 0,
+                context: nil,
+                characters: "\u{1B}",
+                charactersIgnoringModifiers: "\u{1B}",
+                isARepeat: false,
+                keyCode: 53
+            ) else { continue }
+            NSApp.postEvent(event, atStart: true)
+        }
+    }
+
+    func beginAdjusting() {
+        guard !isSampling else { return }
+        let well = adjustmentWell ?? NSColorWell()
+        well.supportsAlpha = true
+        well.target = self
+        well.action = #selector(updateAdjustedColor(_:))
+        well.color = color
+        adjustmentWell = well
+        // Let the native well manage ownership of the shared color panel while
+        // the visible control remains a regular HelloX button.
+        well.activate(true)
+        NSColorPanel.shared.orderFront(nil)
+    }
+
+    private func endAdjusting() {
+        guard let well = adjustmentWell else { return }
+        let ownsPanel = well.isActive
+        well.deactivate()
+        well.target = nil
+        well.action = nil
+        adjustmentWell = nil
+        if ownsPanel { NSColorPanel.shared.orderOut(nil) }
+    }
+
+    @objc private func updateAdjustedColor(_ sender: NSColorWell) {
+        color = sender.color.usingColorSpace(.sRGB) ?? sender.color
+    }
+}
+
+private struct ColorPickerToolView: View {
+    @ObservedObject var model: ColorPickerToolModel
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            HXDialogStyle.background(colorScheme).ignoresSafeArea()
+            VStack(alignment: .leading, spacing: HXSpacing.md) {
+                HStack(spacing: HXSpacing.md) {
+                    colorPreview
+                    VStack(alignment: .leading, spacing: HXSpacing.xxs) {
+                        Text(model.isSampling ? "点击屏幕上的颜色" : "当前颜色")
+                            .font(HXTypography.caption)
+                            .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
+                        Text(model.code.hex)
+                            .font(HXTypography.title.monospaced())
+                            .foregroundStyle(HelloXTheme.primaryText(for: colorScheme))
+                            .textSelection(.enabled)
+                            .lineLimit(1)
+                        HStack(spacing: HXSpacing.xs) {
+                            HelloXUtilityTextButton(
+                                title: model.isSampling ? "正在取色" : "重新取色",
+                                help: "重新取色",
+                                action: model.beginSampling
+                            )
+                            HelloXUtilityTextButton(title: "微调", help: "微调颜色和透明度", action: model.beginAdjusting)
+                        }
+                        .disabled(model.isSampling)
+                        .padding(.top, HXSpacing.xxs)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                VStack(spacing: 0) {
+                    colorCodeRow(label: "HEX", value: model.code.hex)
+                    codeDivider
+                    colorCodeRow(label: model.code.alpha == 255 ? "RGB" : "RGBA", value: model.code.rgb)
+                    codeDivider
+                    colorCodeRow(label: model.code.alpha == 255 ? "HSL" : "HSLA", value: model.code.hsl)
+                }
+                .padding(.horizontal, HXSpacing.sm)
+                .padding(.vertical, HXSpacing.xxs)
+                .background(HelloXTheme.surface(for: colorScheme), in: RoundedRectangle(cornerRadius: HelloXTheme.cardRadius))
+                .overlay {
+                    RoundedRectangle(cornerRadius: HelloXTheme.cardRadius)
+                        .strokeBorder(HelloXTheme.border(for: colorScheme), lineWidth: 1)
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.bottom, 20)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+        .font(HXTypography.body)
+        .tint(HelloXTheme.accent)
+    }
+
+    private var colorPreview: some View {
+        Canvas { context, size in
+            context.fill(Path(CGRect(origin: .zero, size: size)), with: .color(HelloXTheme.surface(for: colorScheme)))
+            let cell = HXSpacing.xs
+            for row in 0..<Int(ceil(size.height / cell)) {
+                for column in 0..<Int(ceil(size.width / cell)) where (row + column).isMultiple(of: 2) {
+                    let rect = CGRect(x: CGFloat(column) * cell, y: CGFloat(row) * cell, width: cell, height: cell)
+                    context.fill(Path(rect), with: .color(HelloXTheme.controlBackground(for: colorScheme)))
+                }
+            }
+            context.fill(Path(CGRect(origin: .zero, size: size)), with: .color(Color(nsColor: model.color)))
+        }
+        .frame(width: 84, height: 84)
+        .clipShape(RoundedRectangle(cornerRadius: HelloXTheme.controlRadius))
+        .overlay {
+            RoundedRectangle(cornerRadius: HelloXTheme.controlRadius)
+                .strokeBorder(HelloXTheme.border(for: colorScheme), lineWidth: 1)
+        }
+        .accessibilityLabel("当前颜色 \(model.code.hex)")
+    }
+
+    private var codeDivider: some View {
+        Rectangle()
+            .fill(HelloXTheme.border(for: colorScheme))
+            .frame(height: 1)
+    }
+
+    private func colorCodeRow(label: String, value: String) -> some View {
+        HStack(spacing: HXSpacing.xs) {
+            Text(label)
+                .font(HXTypography.caption)
+                .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
+                .frame(width: 34, alignment: .leading)
+            Text(value)
+                .font(HXTypography.caption.monospaced())
+                .foregroundStyle(HelloXTheme.primaryText(for: colorScheme))
+                .textSelection(.enabled)
+                .lineLimit(1)
+                .minimumScaleFactor(0.9)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            HelloXIconButton(icon: .copy, help: "复制 \(label) 颜色代码", size: 28, iconSize: 14) {
+                _ = UtilityClipboard.copy(value)
+            }
+        }
+        .frame(height: 36)
+    }
+}
+
 private struct PasswordToolView: View {
     @State private var length = 20
     @State private var lowercase = true
@@ -490,8 +777,8 @@ private struct PasswordToolView: View {
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
-        UtilityToolShell(tool: .password, subtitle: "使用系统安全随机源生成高强度密码") {
-            VStack(spacing: 18) {
+        UtilityToolShell {
+            VStack(spacing: 12) {
                 HelloXCard {
                     VStack(spacing: 16) {
                         TextField("随机密码", text: $password)
@@ -501,7 +788,7 @@ private struct PasswordToolView: View {
                             .background(HelloXTheme.controlBackground(for: colorScheme), in: RoundedRectangle(cornerRadius: HelloXTheme.controlRadius))
                             .overlay(RoundedRectangle(cornerRadius: HelloXTheme.controlRadius).stroke(HelloXTheme.border(for: colorScheme)))
                         HStack {
-                            Text("长度：\(length)").font(.system(size: 13, weight: .semibold))
+                            Text("长度：\(length)").font(HXTypography.section)
                             Slider(value: Binding(get: { Double(length) }, set: { length = Int($0) }), in: 8...128, step: 1)
                         }
                         HStack(spacing: 18) {
@@ -515,7 +802,7 @@ private struct PasswordToolView: View {
                 }
                 HStack {
                     if !errorMessage.isEmpty {
-                        Text(errorMessage).font(.system(size: 11)).foregroundStyle(HelloXTheme.error)
+                        Text(errorMessage).font(HXTypography.caption).foregroundStyle(HelloXTheme.error)
                     }
                     Spacer()
                     HelloXUtilityTextButton(title: "重新生成", help: "重新生成", role: .accent, action: generate)
@@ -524,14 +811,13 @@ private struct PasswordToolView: View {
                     }
                         .disabled(password.isEmpty)
                 }
-                Spacer()
             }
             .onAppear(perform: generate)
-            .onChange(of: length) { _ in generate() }
-            .onChange(of: lowercase) { _ in generate() }
-            .onChange(of: uppercase) { _ in generate() }
-            .onChange(of: numbers) { _ in generate() }
-            .onChange(of: symbols) { _ in generate() }
+            .onChange(of: length) { generate() }
+            .onChange(of: lowercase) { generate() }
+            .onChange(of: uppercase) { generate() }
+            .onChange(of: numbers) { generate() }
+            .onChange(of: symbols) { generate() }
         }
     }
 
@@ -560,14 +846,235 @@ enum MarkdownWorkspaceMode: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+private final class MarkdownLocalImageSchemeHandler: NSObject, WKURLSchemeHandler {
+    private static let maximumConcurrentLoadCount = 3
+    private static let maximumQueuedLoadCount = 128
+
+    private struct LoadedImage: Sendable {
+        let data: Data
+        let mimeType: String
+    }
+
+    private enum LoadResult: Sendable {
+        case success(LoadedImage)
+        case failure(code: Int, description: String)
+    }
+
+    private final class SchemeTaskReference {
+        let task: any WKURLSchemeTask
+
+        init(_ task: any WKURLSchemeTask) {
+            self.task = task
+        }
+    }
+
+    private struct LoadRequest {
+        let taskReference: SchemeTaskReference
+        let requestURL: URL
+        let fileURL: URL
+        let allowedDirectoryURL: URL
+        var worker: Task<Void, Never>?
+    }
+
+    private final class WeakHandlerReference: @unchecked Sendable {
+        weak var handler: MarkdownLocalImageSchemeHandler?
+
+        init(_ handler: MarkdownLocalImageSchemeHandler) {
+            self.handler = handler
+        }
+    }
+
+    private var allowedDirectoryURL: URL?
+    private var loadRequests: [ObjectIdentifier: LoadRequest] = [:]
+    private var pendingLoadIdentifiers: [ObjectIdentifier] = []
+    private var runningLoadCount = 0
+
+    func setAllowedDirectory(_ directoryURL: URL?) {
+        let nextDirectoryURL = directoryURL.flatMap { url -> URL? in
+            guard url.isFileURL else { return nil }
+            return URL(fileURLWithPath: url.standardizedFileURL.path, isDirectory: true)
+        }
+        guard nextDirectoryURL != allowedDirectoryURL else { return }
+        loadRequests.values.forEach { $0.worker?.cancel() }
+        loadRequests.removeAll()
+        pendingLoadIdentifiers.removeAll()
+        runningLoadCount = 0
+        allowedDirectoryURL = nextDirectoryURL
+    }
+
+    func webView(_ webView: WKWebView, start urlSchemeTask: any WKURLSchemeTask) {
+        guard let requestURL = urlSchemeTask.request.url,
+              let fileURL = MarkdownLocalImageScheme.fileURL(for: requestURL),
+              let allowedDirectoryURL else {
+            fail(urlSchemeTask, code: 400, description: "无效的本地图片地址。")
+            return
+        }
+
+        let identifier = ObjectIdentifier(urlSchemeTask as AnyObject)
+        cancelLoad(identifier)
+        guard loadRequests.count < Self.maximumQueuedLoadCount else {
+            fail(urlSchemeTask, code: 429, description: "Markdown 中待加载的本地图片过多。")
+            return
+        }
+        loadRequests[identifier] = LoadRequest(
+            taskReference: SchemeTaskReference(urlSchemeTask),
+            requestURL: requestURL,
+            fileURL: fileURL,
+            allowedDirectoryURL: allowedDirectoryURL,
+            worker: nil
+        )
+        pendingLoadIdentifiers.append(identifier)
+        startPendingLoads()
+    }
+
+    func webView(_ webView: WKWebView, stop urlSchemeTask: any WKURLSchemeTask) {
+        let identifier = ObjectIdentifier(urlSchemeTask as AnyObject)
+        cancelLoad(identifier)
+        startPendingLoads()
+    }
+
+    private func startPendingLoads() {
+        while runningLoadCount < Self.maximumConcurrentLoadCount,
+              !pendingLoadIdentifiers.isEmpty {
+            let identifier = pendingLoadIdentifiers.removeFirst()
+            guard var request = loadRequests[identifier], request.worker == nil else { continue }
+            let handlerReference = WeakHandlerReference(self)
+            let fileURL = request.fileURL
+            let allowedDirectoryURL = request.allowedDirectoryURL
+            request.worker = Task.detached(priority: .userInitiated) {
+                let result = Self.loadImage(
+                    at: fileURL,
+                    containedIn: allowedDirectoryURL
+                )
+                guard !Task.isCancelled else { return }
+                await MainActor.run {
+                    handlerReference.handler?.finishLoad(identifier, with: result)
+                }
+            }
+            loadRequests[identifier] = request
+            runningLoadCount += 1
+        }
+    }
+
+    private func cancelLoad(_ identifier: ObjectIdentifier) {
+        guard let request = loadRequests.removeValue(forKey: identifier) else { return }
+        if let worker = request.worker {
+            worker.cancel()
+            runningLoadCount = max(0, runningLoadCount - 1)
+        } else {
+            pendingLoadIdentifiers.removeAll { $0 == identifier }
+        }
+    }
+
+    private func finishLoad(_ identifier: ObjectIdentifier, with result: LoadResult) {
+        guard let request = loadRequests.removeValue(forKey: identifier),
+              request.worker != nil else { return }
+        runningLoadCount = max(0, runningLoadCount - 1)
+        complete(request.taskReference.task, requestURL: request.requestURL, with: result)
+        startPendingLoads()
+    }
+
+    private nonisolated static func loadImage(
+        at fileURL: URL,
+        containedIn allowedDirectoryURL: URL
+    ) -> LoadResult {
+        let maximumImageByteCount = 64 * 1_024 * 1_024
+        guard let resolvedFileURL = MarkdownLocalImageScheme.resolvedFileURL(
+            fileURL,
+            containedIn: allowedDirectoryURL
+        ) else {
+            return .failure(code: 403, description: "图片路径超出了 Markdown 文档目录。")
+        }
+
+        do {
+            let values = try resolvedFileURL.resourceValues(
+                forKeys: [.contentTypeKey, .fileSizeKey, .isRegularFileKey]
+            )
+            guard values.isRegularFile == true,
+                  let contentType = values.contentType,
+                  contentType.conforms(to: .image) else {
+                return .failure(code: 415, description: "该本地资源不是支持的图片文件。")
+            }
+            if let fileSize = values.fileSize, fileSize > maximumImageByteCount {
+                return .failure(code: 413, description: "本地图片超过 64 MB，无法预览。")
+            }
+
+            let fileHandle = try FileHandle(forReadingFrom: resolvedFileURL)
+            defer { try? fileHandle.close() }
+            var data = Data()
+            data.reserveCapacity(min(values.fileSize ?? 0, maximumImageByteCount))
+            while data.count <= maximumImageByteCount, !Task.isCancelled {
+                let remainingByteCount = maximumImageByteCount + 1 - data.count
+                guard let chunk = try fileHandle.read(upToCount: min(1_048_576, remainingByteCount)),
+                      !chunk.isEmpty else { break }
+                data.append(chunk)
+            }
+            guard data.count <= maximumImageByteCount else {
+                return .failure(code: 413, description: "本地图片超过 64 MB，无法预览。")
+            }
+            return .success(LoadedImage(
+                data: data,
+                mimeType: contentType.preferredMIMEType ?? "application/octet-stream"
+            ))
+        } catch {
+            return .failure(code: 404, description: error.localizedDescription)
+        }
+    }
+
+    private func complete(
+        _ urlSchemeTask: any WKURLSchemeTask,
+        requestURL: URL,
+        with result: LoadResult
+    ) {
+        switch result {
+        case .success(let image):
+            let response = URLResponse(
+                url: requestURL,
+                mimeType: image.mimeType,
+                expectedContentLength: image.data.count,
+                textEncodingName: nil
+            )
+            urlSchemeTask.didReceive(response)
+            urlSchemeTask.didReceive(image.data)
+            urlSchemeTask.didFinish()
+        case .failure(let code, let description):
+            fail(urlSchemeTask, code: code, description: description)
+        }
+    }
+
+    private func fail(
+        _ urlSchemeTask: any WKURLSchemeTask,
+        code: Int,
+        description: String
+    ) {
+        urlSchemeTask.didFailWithError(NSError(
+            domain: "HelloX.MarkdownLocalImage",
+            code: code,
+            userInfo: [NSLocalizedDescriptionKey: description]
+        ))
+    }
+}
+
 @MainActor
 final class MarkdownPreviewModel: NSObject, ObservableObject, WKNavigationDelegate {
     let webView: WKWebView
+    private let localImageSchemeHandler: MarkdownLocalImageSchemeHandler
     private var renderKey = ""
 
     override init() {
         let configuration = WKWebViewConfiguration()
+        let localImageSchemeHandler = MarkdownLocalImageSchemeHandler()
         configuration.websiteDataStore = .nonPersistent()
+        configuration.userContentController.addUserScript(WKUserScript(
+            source: MarkdownImageViewer.script,
+            injectionTime: .atDocumentEnd,
+            forMainFrameOnly: true
+        ))
+        configuration.setURLSchemeHandler(
+            localImageSchemeHandler,
+            forURLScheme: MarkdownLocalImageScheme.name
+        )
+        self.localImageSchemeHandler = localImageSchemeHandler
         webView = WKWebView(frame: .zero, configuration: configuration)
         super.init()
         webView.navigationDelegate = self
@@ -577,11 +1084,18 @@ final class MarkdownPreviewModel: NSObject, ObservableObject, WKNavigationDelega
     }
 
     func render(markdown: String, title: String, baseURL: URL?) {
-        let html = MarkdownHTMLConverter.convert(markdown, title: title)
+        localImageSchemeHandler.setAllowedDirectory(baseURL)
+        let previewBaseURL = MarkdownLocalImageScheme.previewBaseURL(for: baseURL)
+        let html = MarkdownHTMLConverter.convert(
+            markdown,
+            title: title,
+            baseURL: previewBaseURL,
+            localFileImageScheme: MarkdownLocalImageScheme.name
+        )
         let key = "\(baseURL?.path ?? "")\u{0}\(html)"
         guard key != renderKey else { return }
         renderKey = key
-        webView.loadHTMLString(html, baseURL: baseURL)
+        webView.loadHTMLString(html, baseURL: nil)
     }
 
     func scroll(to headingID: String) {
@@ -590,6 +1104,7 @@ final class MarkdownPreviewModel: NSObject, ObservableObject, WKNavigationDelega
 
     func pdfData() async throws -> Data {
         try await waitUntilDocumentIsReady()
+        _ = try await webView.evaluateJavaScript("document.getElementById('hx-image-viewer')?.close(); true;")
         let configuration = WKPDFConfiguration()
         let contentSize = try await documentSize()
         configuration.rect = CGRect(
@@ -665,7 +1180,7 @@ final class MarkdownPreviewModel: NSObject, ObservableObject, WKNavigationDelega
     ) {
         if navigationAction.navigationType == .linkActivated,
            let url = navigationAction.request.url {
-            NSWorkspace.shared.open(url)
+            NSWorkspace.shared.open(MarkdownLocalImageScheme.fileURL(for: url) ?? url)
             decisionHandler(.cancel)
         } else {
             decisionHandler(.allow)
@@ -677,26 +1192,129 @@ final class MarkdownPreviewModel: NSObject, ObservableObject, WKNavigationDelega
 final class MarkdownDocumentTab: ObservableObject, Identifiable {
     let id = UUID()
     @Published var url: URL?
-    @Published var markdown: String
+    @Published var markdown: String {
+        didSet {
+            // Heading IDs are positional; changed headings must not inherit another branch's state.
+            if MarkdownHeadingParser.headings(in: oldValue) != headings {
+                collapsedHeadingIDs.removeAll()
+            }
+        }
+    }
     @Published private(set) var savedMarkdown: String
-    @Published var mode: MarkdownWorkspaceMode = .defaultMode
+    @Published var mode: MarkdownWorkspaceMode = .defaultMode {
+        didSet { updateFileMonitoring() }
+    }
     @Published var isTableOfContentsExpanded = true
+    @Published private(set) var collapsedHeadingIDs: Set<String> = []
     let previewModel = MarkdownPreviewModel()
+    private let fileMonitor = MarkdownFileMonitor()
 
     init(url: URL?, markdown: String) {
         self.url = url?.standardizedFileURL
         self.markdown = markdown
         self.savedMarkdown = markdown
+        fileMonitor.onChange = { [weak self] in
+            guard let self, self.mode == .preview, !self.isModified else { return }
+            _ = try? self.reloadFromDisk()
+        }
+        updateFileMonitoring()
     }
 
     var displayName: String { url?.deletingPathExtension().lastPathComponent ?? "未命名" }
     var isModified: Bool { markdown != savedMarkdown }
     var headings: [MarkdownHeading] { MarkdownHeadingParser.headings(in: markdown) }
+    var outlineRows: [MarkdownOutlineRow] {
+        MarkdownOutline.visibleRows(headings: headings, collapsedIDs: collapsedHeadingIDs)
+    }
     var exportBaseName: String { url?.deletingPathExtension().lastPathComponent ?? "Markdown" }
+
+    func toggleHeading(_ id: String) {
+        if !collapsedHeadingIDs.insert(id).inserted {
+            collapsedHeadingIDs.remove(id)
+        }
+    }
 
     func markSaved(at url: URL) {
         self.url = url.standardizedFileURL
         savedMarkdown = markdown
+        updateFileMonitoring()
+    }
+
+    @discardableResult
+    func reloadFromDisk(discardingUnsavedChanges: Bool = false) throws -> Bool {
+        guard let url else { return false }
+        guard discardingUnsavedChanges || !isModified else { return false }
+        let latestMarkdown = try MarkdownFileService.read(from: url)
+        let didChange = latestMarkdown != markdown
+        savedMarkdown = latestMarkdown
+        markdown = latestMarkdown
+        return didChange
+    }
+
+    private func updateFileMonitoring() {
+        guard mode == .preview, let url else {
+            fileMonitor.stop()
+            return
+        }
+        fileMonitor.start(for: url)
+        guard !isModified else { return }
+        _ = try? reloadFromDisk()
+    }
+}
+
+@MainActor
+private final class MarkdownFileMonitor {
+    var onChange: (() -> Void)?
+
+    private var source: DispatchSourceFileSystemObject?
+    private var monitoredDirectoryURL: URL?
+    private var pendingReload: DispatchWorkItem?
+
+    func start(for fileURL: URL) {
+        let directoryURL = fileURL.deletingLastPathComponent().standardizedFileURL
+        guard monitoredDirectoryURL != directoryURL || source == nil else { return }
+        stop()
+
+        let descriptor = open(directoryURL.path, O_EVTONLY)
+        guard descriptor >= 0 else { return }
+
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: descriptor,
+            eventMask: [.write, .rename, .delete],
+            queue: .main
+        )
+        source.setEventHandler { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.scheduleReload()
+            }
+        }
+        source.setCancelHandler {
+            close(descriptor)
+        }
+        self.source = source
+        monitoredDirectoryURL = directoryURL
+        source.activate()
+    }
+
+    func stop() {
+        pendingReload?.cancel()
+        pendingReload = nil
+        source?.cancel()
+        source = nil
+        monitoredDirectoryURL = nil
+    }
+
+    private func scheduleReload() {
+        pendingReload?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.onChange?()
+        }
+        pendingReload = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: workItem)
+    }
+
+    deinit {
+        source?.cancel()
     }
 }
 
@@ -786,9 +1404,7 @@ private enum MarkdownScrollChrome {
             scrollView.contentView.backgroundColor = .clear
             scrollView.hasVerticalScroller = true
             scrollView.hasHorizontalScroller = false
-            if scrollView.verticalScroller is HelloXOverlayScroller == false {
-                scrollView.verticalScroller = HelloXOverlayScroller(frame: .zero)
-            }
+            HelloXScrollChrome.apply(to: scrollView)
             scrollView.verticalScroller?.isHidden = false
         }
     }
@@ -809,8 +1425,8 @@ private struct MarkdownToolView: View {
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
-        UtilityToolShell(tool: .markdown, subtitle: "阅读、编辑并导出 Markdown 文档") {
-            VStack(spacing: 12) {
+        UtilityToolShell {
+            VStack(spacing: 10) {
                 commandBar
                 if !workspace.documents.isEmpty { tabBar }
                 Group {
@@ -820,42 +1436,57 @@ private struct MarkdownToolView: View {
                             message: message,
                             failed: failed
                         )
+                        // The editor and preview are stateful AppKit/SwiftUI views.
+                        // Recreate this subtree when the active tab changes so they
+                        // cannot retain the previously selected document's content.
+                        .id(document.id)
                     } else {
                         Color.clear
                     }
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
         }
         .onAppear { consume(openRouter.request) }
-        .onChange(of: openRouter.request) { consume($0) }
+        .onChange(of: openRouter.request) { _, request in consume(request) }
     }
 
     private var commandBar: some View {
         HStack(spacing: 8) {
-            commandButton("打开", help: "打开 Markdown", action: openMarkdown)
-                .keyboardShortcut("o", modifiers: .command)
+            fileMenu
             if let document = workspace.activeDocument {
                 MarkdownModePicker(document: document)
-                commandButton("保存", help: "保存 Markdown", isAccent: true) {
-                    _ = save(document, saveAs: false)
+                if document.mode == .preview {
+                    commandButton("刷新", help: "重新读取磁盘上的 Markdown") {
+                        refresh(document)
+                    }
+                    .keyboardShortcut("r", modifiers: .command)
                 }
-                .keyboardShortcut("s", modifiers: .command)
-                commandButton("另存为", help: "Markdown 另存为") {
-                    _ = save(document, saveAs: true)
-                }
-                exportMenu(for: document)
             }
             Spacer(minLength: 8)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 9)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
         .background(HelloXTheme.raisedSurface(for: colorScheme), in: RoundedRectangle(cornerRadius: HelloXTheme.cardRadius))
+        .background {
+            // Keep the established document shortcuts available while the
+            // visible commands live in the shared dropdown menu.
+            VStack {
+                Button("打开 Markdown", action: openMarkdown)
+                    .keyboardShortcut("o", modifiers: .command)
+                if let document = workspace.activeDocument {
+                    Button("保存 Markdown") { _ = save(document, saveAs: false) }
+                        .keyboardShortcut("s", modifiers: .command)
+                }
+            }
+            .hidden()
+            .accessibilityHidden(true)
+        }
     }
 
     private var tabBar: some View {
         ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 6) {
+            HStack(spacing: 2) {
                 ForEach(workspace.documents) { document in
                     MarkdownDocumentTabControl(
                         document: document,
@@ -865,9 +1496,10 @@ private struct MarkdownToolView: View {
                     )
                 }
             }
-            .padding(.horizontal, 2)
+            .padding(2)
+            .background(HXSegmentedStyle.track(for: colorScheme), in: RoundedRectangle(cornerRadius: 10))
         }
-        .frame(height: 32)
+        .frame(height: 28)
     }
 
     private func commandButton(
@@ -884,30 +1516,26 @@ private struct MarkdownToolView: View {
         )
     }
 
-    private func commandLabel(_ title: String) -> some View {
-        HelloXUtilityButtonLabel(title: title, role: .neutral)
-    }
-
-    private func exportMenu(for document: MarkdownDocumentTab) -> some View {
-        ZStack {
-            commandLabel("导出")
-                .allowsHitTesting(false)
-                .accessibilityHidden(true)
-            Menu {
-                Button("导出 PDF") { exportPDF(document) }
-                Button("导出 HTML") { exportHTML(document) }
-            } label: {
-                Color.clear
-                    .frame(width: HelloXUtilityButtonMetrics.width, height: HelloXUtilityButtonMetrics.height)
-                    .contentShape(Rectangle())
+    private var fileMenu: some View {
+        let document = workspace.activeDocument
+        return HXDropdownMenu("文件", showsChevron: false, actions: [
+            HXDropdownAction("打开", action: openMarkdown),
+            HXDropdownAction("保存", isEnabled: document != nil) {
+                if let document { _ = save(document, saveAs: false) }
+            },
+            HXDropdownAction("另存为", isEnabled: document != nil) {
+                if let document { _ = save(document, saveAs: true) }
+            },
+            HXDropdownAction("导出 PDF", isEnabled: document != nil) {
+                if let document { exportPDF(document) }
+            },
+            HXDropdownAction("导出 HTML", isEnabled: document != nil) {
+                if let document { exportHTML(document) }
             }
-            .menuStyle(.borderlessButton)
-            .menuIndicator(.hidden)
-            .frame(width: HelloXUtilityButtonMetrics.width, height: HelloXUtilityButtonMetrics.height)
-            .accessibilityLabel("导出 Markdown")
-        }
+        ])
         .fixedSize()
-        .help("导出 Markdown")
+        .accessibilityLabel("文件")
+        .help("打开、保存或导出 Markdown")
     }
 
     private func openMarkdown() {
@@ -947,7 +1575,7 @@ private struct MarkdownToolView: View {
             workspace.close(document)
             return
         }
-        let alert = NSAlert()
+        let alert = HelloXAlert()
         alert.alertStyle = .warning
         alert.messageText = "要保存对“\(document.displayName)”的更改吗？"
         alert.addButton(withTitle: "保存")
@@ -960,6 +1588,29 @@ private struct MarkdownToolView: View {
             workspace.close(document)
         default:
             break
+        }
+    }
+
+    private func refresh(_ document: MarkdownDocumentTab) {
+        if document.isModified {
+            let alert = HelloXAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "要放弃对“\(document.displayName)”的未保存更改并刷新吗？"
+            alert.informativeText = "刷新后将显示磁盘上的最新内容。"
+            alert.addButton(withTitle: "放弃更改并刷新")
+            alert.addButton(withTitle: "取消")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
+
+        do {
+            let didChange = try document.reloadFromDisk(discardingUnsavedChanges: true)
+            failed = false
+            message = didChange
+                ? "已刷新：\(document.displayName)"
+                : "已是最新：\(document.displayName)"
+        } catch {
+            failed = true
+            message = error.localizedDescription
         }
     }
 
@@ -1057,7 +1708,8 @@ private struct MarkdownDocumentTabControl: View {
             }
             .buttonStyle(.plain)
             Button(action: onClose) {
-                HelloXIcon(icon: .close, size: 11)
+                HelloXIcon(icon: .close, size: 16)
+                    .foregroundStyle(HelloXTheme.iconForeground(for: colorScheme))
                     .frame(width: 20, height: 20)
                     .contentShape(Rectangle())
             }
@@ -1065,15 +1717,17 @@ private struct MarkdownDocumentTabControl: View {
             .help("关闭 \(document.displayName)")
             .accessibilityLabel("关闭 \(document.displayName)")
         }
-        .font(.system(size: 12, weight: isActive ? .semibold : .regular))
-        .foregroundStyle(isActive ? HelloXTheme.primaryText(for: colorScheme) : HelloXTheme.secondaryText(for: colorScheme))
-        .padding(.leading, 10)
+        .font(.system(size: 12, weight: .medium))
+        .foregroundStyle(HXSegmentedStyle.foreground(isSelected: isActive, for: colorScheme))
+        .padding(.leading, 12)
         .padding(.trailing, 4)
-        .frame(height: 30)
-        .background(
-            isActive ? HelloXTheme.raisedSurface(for: colorScheme) : HelloXTheme.controlBackground(for: colorScheme),
-            in: RoundedRectangle(cornerRadius: HelloXTheme.compactRadius, style: .continuous)
-        )
+        .frame(height: 24)
+        .background {
+            if isActive {
+                RoundedRectangle(cornerRadius: 8).fill(HXSegmentedStyle.selection(for: colorScheme))
+                    .shadow(color: HXSegmentedStyle.shadow(for: colorScheme), radius: 1, y: 1)
+            }
+        }
     }
 }
 
@@ -1081,14 +1735,9 @@ private struct MarkdownModePicker: View {
     @ObservedObject var document: MarkdownDocumentTab
 
     var body: some View {
-        Picker("模式", selection: $document.mode) {
-            ForEach(MarkdownWorkspaceMode.allCases) { Text($0.rawValue).tag($0) }
-        }
-        .labelsHidden()
-        .pickerStyle(.menu)
-        .buttonStyle(.borderless)
-        .controlSize(.large)
-        .frame(width: 152, height: HelloXUtilityButtonMetrics.height)
+        HXSegmentedControl("模式", selection: $document.mode, options:
+            MarkdownWorkspaceMode.allCases.map { HXSegment($0, $0.rawValue) }
+        )
     }
 }
 
@@ -1104,22 +1753,15 @@ private struct MarkdownDocumentWorkspaceView: View {
                 if document.mode == .preview { previewWorkspace }
                 else { editorWorkspace }
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             statusBar
         }
     }
 
     private var previewWorkspace: some View {
         HStack(spacing: 0) {
-            if document.isTableOfContentsExpanded {
-                tableOfContents
-                    .frame(width: 230)
-                    .transition(.move(edge: .leading).combined(with: .opacity))
-            } else {
-                collapsedTableOfContents
-                    .frame(width: 44)
-                    .transition(.opacity)
-            }
+            MarkdownTableOfContents(document: document)
+                .id(document.id)
             MarkdownWebPreview(
                 model: document.previewModel,
                 markdown: document.markdown,
@@ -1129,90 +1771,13 @@ private struct MarkdownDocumentWorkspaceView: View {
             .background(HelloXTheme.raisedSurface(for: colorScheme))
         }
         .clipShape(RoundedRectangle(cornerRadius: HelloXTheme.cardRadius, style: .continuous))
-        .animation(.easeInOut(duration: 0.18), value: document.isTableOfContentsExpanded)
-    }
-
-    private var tableOfContents: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                HelloXIcon(icon: .text, size: 16)
-                Text("目录").font(.system(size: 13, weight: .bold))
-                Spacer()
-                Text("\(document.headings.count)")
-                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
-                Button {
-                    document.isTableOfContentsExpanded = false
-                } label: {
-                    HelloXIcon(icon: .chevronRight, size: 14)
-                        .rotationEffect(.degrees(180))
-                        .frame(width: 28, height: 28)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
-                .help("收起目录")
-                .accessibilityLabel("收起目录")
-            }
-            .padding(.horizontal, 14)
-            .padding(.top, 14)
-
-            if document.headings.isEmpty {
-                Spacer()
-            } else {
-                ScrollView(.vertical) {
-                    VStack(alignment: .leading, spacing: 3) {
-                        ForEach(document.headings) { heading in
-                            Button {
-                                document.previewModel.scroll(to: heading.id)
-                            } label: {
-                                Text(heading.title)
-                                    .font(.system(size: heading.level == 1 ? 12 : 11, weight: heading.level <= 2 ? .semibold : .regular))
-                                    .foregroundStyle(HelloXTheme.primaryText(for: colorScheme))
-                                    .lineLimit(2)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .padding(.leading, CGFloat(max(0, heading.level - 1)) * 12)
-                                    .padding(.horizontal, 10)
-                                    .padding(.vertical, 7)
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                    .padding(.horizontal, 4)
-                    .padding(.bottom, 12)
-                }
-                .scrollContentBackground(.hidden)
-                .visibleScrollChrome()
-            }
-        }
-        .background(HelloXTheme.controlBackground(for: colorScheme))
-    }
-
-    private var collapsedTableOfContents: some View {
-        VStack(spacing: 0) {
-            Button {
-                document.isTableOfContentsExpanded = true
-            } label: {
-                HelloXIcon(icon: .chevronRight, size: 15)
-                    .frame(width: 32, height: 32)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
-            .help("展开目录")
-            .accessibilityLabel("展开目录")
-            .padding(.top, 9)
-            Spacer()
-        }
-        .frame(maxHeight: .infinity)
-        .background(HelloXTheme.controlBackground(for: colorScheme))
     }
 
     private var editorWorkspace: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Text("Markdown 源码")
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(HXTypography.section)
                 Spacer()
                 HelloXUtilityTextButton(title: "完成并预览", help: "完成编辑并预览", role: .accent) {
                     document.mode = .preview
@@ -1237,18 +1802,6 @@ private struct MarkdownDocumentWorkspaceView: View {
             Text("\(document.markdown.count) 字符 · \(document.headings.count) 个标题")
                 .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
         }
-        .font(.system(size: 11, weight: .medium))
-    }
-}
-
-private extension UtilityTool {
-    var icon: HelloXIconKey {
-        switch self {
-        case .csvToExcel: .save
-        case .base64: .copy
-        case .qrCode: .qrCode
-        case .password: .privacy
-        case .markdown: .text
-        }
+        .font(HXTypography.caption)
     }
 }

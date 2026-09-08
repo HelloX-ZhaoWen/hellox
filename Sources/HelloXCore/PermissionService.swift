@@ -10,34 +10,74 @@ public enum ScreenRecordingPermissionState: Equatable, Sendable {
     case error(String)
 }
 
+public enum PrivacyPermission: String, CaseIterable, Codable, Sendable, Identifiable {
+    case screenRecording
+    case accessibility
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .screenRecording: "屏幕录制"
+        case .accessibility: "辅助功能"
+        }
+    }
+
+    public var settingsURL: String {
+        switch self {
+        case .screenRecording: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+        case .accessibility: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+        }
+    }
+}
+
 @MainActor
 public final class PermissionService: ObservableObject {
     @Published public private(set) var canRecordScreen = CGPreflightScreenCaptureAccess()
     @Published public private(set) var canUseAccessibility = AXIsProcessTrusted()
     @Published public private(set) var screenRecordingState: ScreenRecordingPermissionState
-    private var screenPermissionFlowStarted = false
+    private var screenPermissionRequiresRelaunch = false
 
     public init() {
         screenRecordingState = CGPreflightScreenCaptureAccess() ? .authorized : .denied
     }
 
-    public func refresh(returnedFromSettings: Bool = false) {
+    public func refresh(returnedFromSettings _: Bool = false) {
         canRecordScreen = CGPreflightScreenCaptureAccess()
         canUseAccessibility = AXIsProcessTrusted()
         if canRecordScreen {
             screenRecordingState = .authorized
-            screenPermissionFlowStarted = false
-        } else if screenPermissionFlowStarted {
+            screenPermissionRequiresRelaunch = false
+        } else if screenPermissionRequiresRelaunch {
             screenRecordingState = .requiresRelaunch
         } else {
             screenRecordingState = .denied
         }
     }
 
+    public func isGranted(_ permission: PrivacyPermission) -> Bool {
+        switch permission {
+        case .screenRecording: canRecordScreen
+        case .accessibility: canUseAccessibility
+        }
+    }
+
+    @discardableResult
+    public func request(_ permission: PrivacyPermission) -> Bool {
+        switch permission {
+        case .screenRecording: requestScreenRecording()
+        case .accessibility: requestAccessibility(prompt: true)
+        }
+    }
+
+    public func openSettings(for permission: PrivacyPermission) {
+        openSettings(permission.settingsURL)
+    }
+
     @discardableResult
     public func requestScreenRecording() -> Bool {
-        screenPermissionFlowStarted = true
         let granted = CGRequestScreenCaptureAccess()
+        screenPermissionRequiresRelaunch = granted && !CGPreflightScreenCaptureAccess()
         refresh()
         return granted
     }
@@ -52,23 +92,18 @@ public final class PermissionService: ObservableObject {
         return canUseAccessibility
     }
 
-    public func openScreenRecordingSettings() {
-        screenPermissionFlowStarted = true
-        openSettings("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
-    }
-
     public func markScreenCaptureFailure(_ message: String) {
         refresh()
-        screenRecordingState = canRecordScreen ? .error(message) : .requiresRelaunch
-    }
-
-    public func resetScreenPermissionFlow() {
-        screenPermissionFlowStarted = false
-        refresh()
+        if canRecordScreen {
+            screenRecordingState = .error(message)
+        } else {
+            screenPermissionRequiresRelaunch = true
+            screenRecordingState = .requiresRelaunch
+        }
     }
 
     public func openAccessibilitySettings() {
-        openSettings("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+        openSettings(for: .accessibility)
     }
 
     private func openSettings(_ value: String) {

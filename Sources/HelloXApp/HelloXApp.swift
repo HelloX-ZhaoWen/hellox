@@ -3,40 +3,44 @@ import HelloXCore
 import SwiftUI
 
 @main
+enum HelloXLauncher {
+    @MainActor static func main() {
+        // CoreText reads this on first font creation, before SwiftUI initializes
+        // the application delegate and its system fonts.
+        HXTypography.configureRendering()
+        HelloXApp.main()
+    }
+}
+
 struct HelloXApp: App {
     @NSApplicationDelegateAdaptor(HelloXApplicationDelegate.self) private var applicationDelegate
     @StateObject private var model: AppModel
     private let hotKeyManager: GlobalHotKeyManager
     private let statusItemController: StatusItemController
+    private let actionDispatcher: HelloXActionDispatcher
+    private let dynamicIslandController: DynamicIslandWindowController
 
     init() {
+        HelloXAppearance.applyGlobally()
         let model = AppModel()
         _model = StateObject(wrappedValue: model)
-        let manager = GlobalHotKeyManager { action in
-            Task { @MainActor in
-                switch action {
-                case .regionCapture: model.startCapture(.region)
-                case .windowCapture: model.startCapture(.window)
-                case .fullScreenCapture: model.startCapture(.fullScreen)
-                case .scrollingCapture: model.startCapture(.scrolling)
-                case .screenRecording: model.startScreenRecording()
-                case .watermarkImage: model.importImageForWatermark()
-                case .captureAndOCR: model.captureAndOCR()
-                case .textTranslation: model.showTextTranslation()
-                case .captureAndTranslate: model.captureAndTranslate()
-                case .translateSelection: model.translateSelectedText()
-                case .csvToExcel: model.showUtilityTool(.csvToExcel)
-                case .base64: model.showUtilityTool(.base64)
-                case .qrCode: model.showUtilityTool(.qrCode)
-                case .password: model.showUtilityTool(.password)
-                case .markdown: model.showUtilityTool(.markdown)
-                }
-            }
+        let dispatcher = HelloXActionDispatcher(model: model)
+        let manager = GlobalHotKeyManager { action, initialCaptures in
+            dispatcher.perform(
+                action,
+                source: .globalHotKey,
+                initialDisplayCaptures: initialCaptures
+            )
         }
         hotKeyManager = manager
-        statusItemController = StatusItemController(model: model)
+        actionDispatcher = dispatcher
+        statusItemController = StatusItemController(model: model, dispatcher: dispatcher)
+        dynamicIslandController = DynamicIslandWindowController(model: model, dispatcher: dispatcher)
         applicationDelegate.openDocumentsHandler = { [weak model] urls in
             model?.openDocuments(urls)
+        }
+        applicationDelegate.reopenHandler = { [weak model] in
+            model?.showSettingsWindow()
         }
         model.shortcutApplyHandler = { manager.apply($0) }
         model.shortcutAvailabilityHandler = { action, binding in
@@ -52,31 +56,49 @@ struct HelloXApp: App {
             return
         }
 
-        // 首次启动时请求屏幕录制和辅助功能权限
-        if !UserDefaults.standard.bool(forKey: "HelloXDidRequestPermissions") {
-            UserDefaults.standard.set(true, forKey: "HelloXDidRequestPermissions")
-            Task { @MainActor in
-                _ = model.permissions.requestScreenRecording()
-                _ = model.permissions.requestAccessibility(prompt: true)
-            }
-        }
-
+        dynamicIslandController.start()
     }
 
     var body: some Scene {
         Settings {
             EmptyView()
         }
+        .commands {
+            CommandGroup(replacing: .appSettings) {
+                Button("设置") { model.showSettingsWindow() }
+                    .keyboardShortcut(",", modifiers: .command)
+            }
+            CommandGroup(replacing: .help) {
+                Link("HelloX 帮助", destination: URL(string: "https://github.com/HelloX-ZhaoWen/hellox")!)
+            }
+        }
     }
 }
 
 @MainActor
 final class HelloXApplicationDelegate: NSObject, NSApplicationDelegate {
+    var reopenHandler: (() -> Void)?
     var openDocumentsHandler: (([URL]) -> Void)? {
         didSet { deliverPendingDocumentsIfPossible() }
     }
 
     private var pendingDocumentURLs: [URL] = []
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        DockVisibilityController.shared.start(windows: NSApp.windows.filter {
+            $0 is HelloXWindow && ($0.isVisible || $0.isMiniaturized)
+        })
+    }
+
+    func applicationShouldHandleReopen(
+        _ sender: NSApplication,
+        hasVisibleWindows flag: Bool
+    ) -> Bool {
+        // The always-visible island or a utility window must not prevent a
+        // Dock click from opening the main HelloX window.
+        reopenHandler?()
+        return true
+    }
 
     func application(_ application: NSApplication, open urls: [URL]) {
         routeOpenDocuments(urls)
@@ -108,11 +130,13 @@ final class HelloXApplicationDelegate: NSObject, NSApplicationDelegate {
 @MainActor
 private final class StatusItemController: NSObject, NSMenuDelegate {
     private let model: AppModel
+    private let dispatcher: HelloXActionDispatcher
     private let statusItem: NSStatusItem
     private let statusMenu = NSMenu()
 
-    init(model: AppModel) {
+    init(model: AppModel, dispatcher: HelloXActionDispatcher) {
         self.model = model
+        self.dispatcher = dispatcher
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         super.init()
         guard let button = statusItem.button else { return }
@@ -137,7 +161,7 @@ private final class StatusItemController: NSObject, NSMenuDelegate {
             menu.addItem(.separator())
         }
 
-        menu.addItem(item(title: "打开主页面", action: #selector(openMainWindow)))
+        menu.addItem(item(title: "设置", action: #selector(openSettingsWindow)))
         menu.addItem(.separator())
         menu.addItem(item(title: "退出 HelloX", action: #selector(terminateApplication)))
     }
@@ -163,31 +187,15 @@ private final class StatusItemController: NSObject, NSMenuDelegate {
     @objc private func performAction(_ sender: NSMenuItem) {
         guard let rawValue = sender.representedObject as? String,
               let action = ShortcutAction(rawValue: rawValue) else { return }
-        switch action {
-        case .regionCapture: model.startCapture(.region)
-        case .windowCapture: model.startCapture(.window)
-        case .fullScreenCapture: model.startCapture(.fullScreen)
-        case .scrollingCapture: model.startCapture(.scrolling)
-        case .screenRecording: model.startScreenRecording()
-        case .watermarkImage: model.importImageForWatermark()
-        case .captureAndOCR: model.captureAndOCR()
-        case .textTranslation: model.showTextTranslation()
-        case .captureAndTranslate: model.captureAndTranslate()
-        case .translateSelection: model.translateSelectedText()
-        case .csvToExcel: model.showUtilityTool(.csvToExcel)
-        case .base64: model.showUtilityTool(.base64)
-        case .qrCode: model.showUtilityTool(.qrCode)
-        case .password: model.showUtilityTool(.password)
-        case .markdown: model.showUtilityTool(.markdown)
-        }
+        dispatcher.perform(action, source: .statusMenu)
     }
 
     @objc private func clearError() {
         model.lastError = nil
     }
 
-    @objc private func openMainWindow() {
-        model.showMainWindow()
+    @objc private func openSettingsWindow() {
+        model.showSettingsWindow()
     }
 
     @objc private func terminateApplication() {
@@ -211,7 +219,7 @@ enum InstallationGate {
     @MainActor
     static func presentRequirementAndTerminate() {
         NSApp.activate(ignoringOtherApps: true)
-        let alert = NSAlert()
+        let alert = HelloXAlert()
         alert.alertStyle = .informational
         alert.messageText = "请先安装 HelloX"
         alert.informativeText = "HelloX 必须安装到“应用程序”文件夹后才能使用。请打开安装镜像中的“安装 HelloX.pkg”完成安装。"
@@ -222,14 +230,17 @@ enum InstallationGate {
 }
 
 @MainActor
-private enum MenuBarIcon {
+enum MenuBarIcon {
     static let image: NSImage = {
-        let source = NSApp.applicationIconImage
-            ?? NSImage(systemSymbolName: "x.circle.fill", accessibilityDescription: "HelloX")
+        let image = HelloXResourceBundle.bundle
+            .url(forResource: "HelloXMenuBarIcon", withExtension: "png")
+            .flatMap(NSImage.init(contentsOf:))
+            ?? NSImage(systemSymbolName: "infinity", accessibilityDescription: "HelloX")
             ?? NSImage(size: NSSize(width: 18, height: 18))
-        let image = (source.copy() as? NSImage) ?? source
         image.size = NSSize(width: 18, height: 18)
-        image.isTemplate = false
+        // Status-bar icons must be template images so AppKit automatically
+        // renders them light on a dark menu bar and dark on a light one.
+        image.isTemplate = true
         return image
     }()
 }

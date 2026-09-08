@@ -15,11 +15,14 @@ enum ShortcutAction: String, CaseIterable, Codable, Sendable, Identifiable {
     case csvToExcel
     case base64
     case qrCode
+    case colorPicker
     case password
     case markdown
 
     static let configurableCases: [ShortcutAction] = [
         .regionCapture,
+        .windowCapture,
+        .fullScreenCapture,
         .scrollingCapture,
         .screenRecording,
         .watermarkImage,
@@ -30,6 +33,7 @@ enum ShortcutAction: String, CaseIterable, Codable, Sendable, Identifiable {
         .csvToExcel,
         .base64,
         .qrCode,
+        .colorPicker,
         .password,
         .markdown
     ]
@@ -51,6 +55,7 @@ enum ShortcutAction: String, CaseIterable, Codable, Sendable, Identifiable {
         case .csvToExcel: "CSV 转 Excel"
         case .base64: "Base64 转换"
         case .qrCode: "二维码识别扫码"
+        case .colorPicker: "取色器（颜色代码）"
         case .password: "密码生成（随机）"
         case .markdown: "Markdown 转换"
         }
@@ -59,12 +64,14 @@ enum ShortcutAction: String, CaseIterable, Codable, Sendable, Identifiable {
     var defaultBinding: ShortcutBinding? {
         switch self {
         case .regionCapture: ShortcutBinding(keyCode: UInt32(kVK_ANSI_A), modifiers: UInt32(optionKey | cmdKey))
+        case .windowCapture: ShortcutBinding(keyCode: UInt32(kVK_ANSI_S), modifiers: UInt32(optionKey | cmdKey))
+        case .fullScreenCapture: ShortcutBinding(keyCode: UInt32(kVK_ANSI_F), modifiers: UInt32(optionKey | cmdKey))
         case .scrollingCapture: ShortcutBinding(keyCode: UInt32(kVK_ANSI_L), modifiers: UInt32(optionKey | cmdKey))
         case .screenRecording: ShortcutBinding(keyCode: UInt32(kVK_ANSI_R), modifiers: UInt32(optionKey | cmdKey))
         case .watermarkImage: ShortcutBinding(keyCode: UInt32(kVK_ANSI_W), modifiers: UInt32(optionKey | cmdKey))
         case .captureAndOCR: ShortcutBinding(keyCode: UInt32(kVK_ANSI_O), modifiers: UInt32(optionKey | cmdKey))
         case .translateSelection: ShortcutBinding(keyCode: UInt32(kVK_ANSI_T), modifiers: UInt32(optionKey | cmdKey))
-        case .windowCapture, .fullScreenCapture, .textTranslation, .captureAndTranslate, .csvToExcel, .base64, .qrCode, .password, .markdown: nil
+        case .textTranslation, .captureAndTranslate, .csvToExcel, .base64, .qrCode, .colorPicker, .password, .markdown: nil
         }
     }
 }
@@ -218,14 +225,14 @@ enum ShortcutPreferences {
 
     static func load() -> [ShortcutAction: ShortcutBinding] {
         if let data = UserDefaults.standard.data(forKey: storageKey),
-           let decoded = try? JSONDecoder().decode([ShortcutAction: ShortcutBinding].self, from: data) {
+           let decoded = decodeStoredBindings(from: data) {
             let result = removingRetiredActions(from: decoded)
-            if result != decoded { save(result) }
+            save(result)
             return result
         }
 
         if let data = UserDefaults.standard.data(forKey: previousStorageKey),
-           let decoded = try? JSONDecoder().decode([ShortcutAction: ShortcutBinding].self, from: data) {
+           let decoded = decodeStoredBindings(from: data) {
             var migrated = decoded
             migrated[.screenRecording] = ShortcutAction.screenRecording.defaultBinding
             migrated = removingRetiredActions(from: migrated)
@@ -234,7 +241,7 @@ enum ShortcutPreferences {
         }
 
         if let data = UserDefaults.standard.data(forKey: legacyStorageKey),
-           let decoded = try? JSONDecoder().decode([ShortcutAction: ShortcutBinding].self, from: data) {
+           let decoded = decodeStoredBindings(from: data) {
             var migrated = decoded
             migrated[.watermarkImage] = ShortcutAction.watermarkImage.defaultBinding
             migrated[.screenRecording] = ShortcutAction.screenRecording.defaultBinding
@@ -269,6 +276,43 @@ enum ShortcutPreferences {
     ) -> [ShortcutAction: ShortcutBinding] {
         bindings.filter { ShortcutAction.configurableCases.contains($0.key) }
     }
+
+    private static func decodeStoredBindings(
+        from data: Data
+    ) -> [ShortcutAction: ShortcutBinding]? {
+        if let decoded = try? JSONDecoder().decode([ShortcutAction: ShortcutBinding].self, from: data) {
+            return decoded
+        }
+        guard let persisted = try? JSONDecoder().decode(
+            [PersistedShortcutAction: ShortcutBinding].self,
+            from: data
+        ) else { return nil }
+        return Dictionary(uniqueKeysWithValues: persisted.compactMap { action, binding in
+            guard let current = ShortcutAction(rawValue: action.rawValue) else { return nil }
+            return (current, binding)
+        })
+    }
+}
+
+/// Reads shortcuts written by older releases without keeping retired actions
+/// in the current product model.
+private enum PersistedShortcutAction: String, Codable {
+    case regionCapture
+    case windowCapture
+    case fullScreenCapture
+    case scrollingCapture
+    case screenRecording
+    case watermarkImage
+    case captureAndOCR
+    case captureAndTranslate
+    case textTranslation
+    case translateSelection
+    case csvToExcel
+    case base64
+    case qrCode
+    case colorPicker
+    case password
+    case markdown
 }
 
 struct ShortcutRegistrationError: LocalizedError, Sendable {

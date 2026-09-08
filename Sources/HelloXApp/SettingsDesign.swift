@@ -3,66 +3,196 @@ import HelloXCore
 import SwiftUI
 
 enum HelloXBrand {
-    static let slogan = "把时间留给真正的自己。"
+    static let slogan = "让你的可能，无限延伸"
+}
+
+enum HelloXAppearanceMode: String, CaseIterable, Identifiable {
+    case system
+    case light
+    case dark
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .system: "跟随系统"
+        case .light: "浅色"
+        case .dark: "暗黑"
+        }
+    }
+
+    var appKitAppearanceName: NSAppearance.Name? {
+        switch self {
+        case .system: nil
+        case .light: .aqua
+        case .dark: .darkAqua
+        }
+    }
+
+    var colorScheme: ColorScheme? {
+        switch self {
+        case .system: nil
+        case .light: .light
+        case .dark: .dark
+        }
+    }
+}
+
+enum HelloXResolvedAppearance {
+    case light
+    case dark
+}
+
+enum HelloXAppearance {
+    static let storageKey = "hello-x-appearance-mode"
+    static let followsSystem = true
+
+    static var mode: HelloXAppearanceMode {
+        guard let rawValue = UserDefaults.standard.string(forKey: storageKey) else { return .system }
+        if rawValue == "dim" || rawValue == "lightsOut" { return .dark }
+        return HelloXAppearanceMode(rawValue: rawValue) ?? .system
+    }
+
+    static func resolved(
+        for systemScheme: ColorScheme,
+        mode: HelloXAppearanceMode? = nil
+    ) -> HelloXResolvedAppearance {
+        // Theme views already receive the selected appearance through their
+        // SwiftUI color-scheme environment. Falling back to the persisted
+        // preference here can leave custom colors one mode behind native
+        // controls during a live switch.
+        switch mode ?? .system {
+        case .system: systemScheme == .dark ? .dark : .light
+        case .light: .light
+        case .dark: .dark
+        }
+    }
+
+    static func colorScheme(for appearance: NSAppearance) -> ColorScheme {
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? .dark : .light
+    }
+
+    @MainActor
+    static func applyGlobally() {
+        apply(mode)
+    }
+
+    @MainActor
+    static func setMode(_ mode: HelloXAppearanceMode) {
+        UserDefaults.standard.set(mode.rawValue, forKey: storageKey)
+        apply(mode)
+    }
+
+    @MainActor
+    private static func apply(_ mode: HelloXAppearanceMode) {
+        let appearance = mode.appKitAppearanceName.flatMap(NSAppearance.init(named:))
+        let application = NSApplication.shared
+        application.appearance = appearance
+        for window in application.windows {
+            // Inherit the application appearance so existing and newly opened
+            // windows use the same source, including live system changes.
+            window.appearance = nil
+        }
+    }
 }
 
 enum HelloXTheme {
-    static let accent = Color(red: 37 / 255, green: 99 / 255, blue: 235 / 255)
-    static let accentPressed = Color(red: 29 / 255, green: 78 / 255, blue: 216 / 255)
-    static let accentBlue = Color(red: 56 / 255, green: 189 / 255, blue: 248 / 255)
-    static let error = Color(red: 220 / 255, green: 38 / 255, blue: 38 / 255)
-    static let success = Color(red: 5 / 255, green: 150 / 255, blue: 105 / 255)
-    static let warning = Color(red: 217 / 255, green: 119 / 255, blue: 6 / 255)
-
-    static let windowRadius: CGFloat = 14
-    static let cardRadius: CGFloat = 13
+    // Matched to the installed Codex UI tokens and the supplied light/dark references.
+    private static func rgb(_ hex: UInt32, alpha: CGFloat = 1) -> NSColor {
+        NSColor(srgbRed: CGFloat((hex >> 16) & 255) / 255,
+                green: CGFloat((hex >> 8) & 255) / 255,
+                blue: CGFloat(hex & 255) / 255, alpha: alpha)
+    }
+    private static func adaptive(_ light: UInt32, _ dark: UInt32) -> Color {
+        Color(nsColor: NSColor(name: nil) { appearance in
+            rgb(appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? dark : light)
+        })
+    }
+    private static func palette(_ light: UInt32, _ dark: UInt32, for scheme: ColorScheme,
+                                mode: HelloXAppearanceMode? = nil, alpha: Double = 1) -> Color {
+        Color(nsColor: rgb(HelloXAppearance.resolved(for: scheme, mode: mode) == .dark ? dark : light,
+                          alpha: alpha))
+    }
+    static let windowBackground = NSColor(name: nil) { appearance in
+        rgb(appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? 0x181818 : 0xFFFFFF)
+    }
+    static let accent = Color(red: 59 / 255, green: 132 / 255, blue: 247 / 255)
+    static let accentBlue = accent
+    static let prominentForeground = adaptive(0xFFFFFF, 0x181818)
+    static let buttonBackground = adaptive(0x1A1C1F, 0xDFDFDF)
+    static let buttonHovered = adaptive(0x393939, 0xFFFFFF)
+    static let buttonPressed = adaptive(0x414141, 0xCDCDCD)
+    static let focusRing = accent
+    static let error = Color(nsColor: .systemRed)
+    static let success = Color(nsColor: .systemGreen)
+    static let warning = Color(nsColor: .systemOrange)
+    static let windowRadius: CGFloat = 12
+    static let cardRadius: CGFloat = 16
     static let controlRadius: CGFloat = 10
     static let compactRadius: CGFloat = 8
-    static let iconSmall: CGFloat = 16
-    static let iconMedium: CGFloat = 19
-    static let iconLarge: CGFloat = 24
-    static let minimumHitSize: CGFloat = 44
-
-    private static let lightPage = Color(red: 251 / 255, green: 252 / 255, blue: 254 / 255)
-    private static let lightSurface = Color.white
-    private static let lightRaisedSurface = Color.white
-    private static let lightText = Color(red: 15 / 255, green: 23 / 255, blue: 42 / 255)
-    private static let lightSecondary = Color(red: 71 / 255, green: 85 / 255, blue: 105 / 255)
-    private static let lightSelection = Color(red: 234 / 255, green: 241 / 255, blue: 1)
-    private static let lightControl = Color(red: 244 / 255, green: 247 / 255, blue: 251 / 255)
-
-    private static let darkPage = Color(red: 7 / 255, green: 16 / 255, blue: 33 / 255)
-    private static let darkSurface = Color(red: 15 / 255, green: 31 / 255, blue: 55 / 255).opacity(0.94)
-    private static let darkRaisedSurface = Color(red: 20 / 255, green: 39 / 255, blue: 68 / 255).opacity(0.98)
-    private static let darkText = Color(red: 248 / 255, green: 250 / 255, blue: 252 / 255)
-    private static let darkSecondary = Color(red: 174 / 255, green: 190 / 255, blue: 214 / 255)
-    private static let darkSelection = Color(red: 24 / 255, green: 58 / 255, blue: 105 / 255)
-    private static let darkControl = Color(red: 20 / 255, green: 42 / 255, blue: 73 / 255).opacity(0.9)
-
-    static func pageBackground(for scheme: ColorScheme) -> Color { scheme == .dark ? darkPage : lightPage }
-    static func sidebarBackground(for scheme: ColorScheme) -> Color { surface(for: scheme) }
-    static func surface(for scheme: ColorScheme) -> Color { scheme == .dark ? darkSurface : lightSurface }
-    static func raisedSurface(for scheme: ColorScheme) -> Color { scheme == .dark ? darkRaisedSurface : lightRaisedSurface }
-    static func primaryText(for scheme: ColorScheme) -> Color { scheme == .dark ? darkText : lightText }
-    static func secondaryText(for scheme: ColorScheme) -> Color { scheme == .dark ? darkSecondary : lightSecondary }
-    static func selectedBackground(for scheme: ColorScheme) -> Color { scheme == .dark ? darkSelection : lightSelection }
-    static func controlBackground(for scheme: ColorScheme) -> Color { scheme == .dark ? darkControl : lightControl }
-
-    static func border(for scheme: ColorScheme) -> Color {
-        .clear
+    static let iconMedium: CGFloat = 16
+    static let minimumHitSize: CGFloat = 28
+    static func pageBackground(for scheme: ColorScheme, appearance: HelloXAppearanceMode? = nil) -> Color {
+        palette(0xFFFFFF, 0x181818, for: scheme, mode: appearance)
     }
-
-    static var accentGradient: Color { accent }
-
+    static func surface(for scheme: ColorScheme, appearance: HelloXAppearanceMode? = nil) -> Color {
+        palette(0xFFFFFF, 0x232323, for: scheme, mode: appearance)
+    }
+    static func raisedSurface(for scheme: ColorScheme, appearance: HelloXAppearanceMode? = nil) -> Color {
+        palette(0xFFFFFF, 0x232323, for: scheme, mode: appearance)
+    }
+    static func primaryText(for scheme: ColorScheme, appearance: HelloXAppearanceMode? = nil) -> Color {
+        palette(0x1A1C1F, 0xFFFFFF, for: scheme, mode: appearance)
+    }
+    static func secondaryText(for scheme: ColorScheme, appearance: HelloXAppearanceMode? = nil) -> Color {
+        palette(0x6A6B6D, 0xB2B2B2, for: scheme, mode: appearance)
+    }
+    static func selectedBackground(for scheme: ColorScheme, appearance: HelloXAppearanceMode? = nil) -> Color {
+        palette(0x1A1C1F, 0xFFFFFF, for: scheme, mode: appearance, alpha: 0.08)
+    }
+    static func iconForeground(for scheme: ColorScheme) -> Color { primaryText(for: scheme) }
+    static func sidebarSearchForeground(for scheme: ColorScheme) -> Color {
+        palette(0x8D8D8D, 0xA1A1A1, for: scheme)
+    }
+    static func sidebarSectionForeground(for scheme: ColorScheme) -> Color {
+        palette(0xA7A7A7, 0x787878, for: scheme)
+    }
+    static func sidebarSearchBackground(for scheme: ColorScheme) -> Color {
+        palette(0xF2F2F2, 0x333333, for: scheme)
+    }
+    static func sidebarSelectedBackground(for scheme: ColorScheme) -> Color {
+        palette(0x1A1C1F, 0xFFFFFF, for: scheme, alpha: scheme == .dark ? 0.08 : 0.05)
+    }
+    static func controlBackground(for scheme: ColorScheme, appearance: HelloXAppearanceMode? = nil) -> Color {
+        palette(0xF4F4F4, 0x2E2E2E, for: scheme, mode: appearance)
+    }
+    static func disabledForeground(for scheme: ColorScheme) -> Color {
+        palette(0x9B9B9B, 0x777777, for: scheme)
+    }
+    static func disabledBackground(for scheme: ColorScheme) -> Color {
+        palette(0xF4F4F4, 0x262626, for: scheme)
+    }
+    static func disabledBorder(for scheme: ColorScheme) -> Color {
+        palette(0xE8E8E8, 0x333333, for: scheme)
+    }
+    static func hoverBackground(for scheme: ColorScheme, appearance: HelloXAppearanceMode? = nil) -> Color {
+        palette(0x1A1C1F, 0xFFFFFF, for: scheme, mode: appearance, alpha: 0.05)
+    }
+    static func pressedBackground(for scheme: ColorScheme, appearance: HelloXAppearanceMode? = nil) -> Color {
+        palette(0x1A1C1F, 0xFFFFFF, for: scheme, mode: appearance, alpha: 0.12)
+    }
+    static func border(for scheme: ColorScheme, appearance: HelloXAppearanceMode? = nil) -> Color {
+        palette(0xEDEDED, 0x353535, for: scheme, mode: appearance)
+    }
     static func cardGradient(for scheme: ColorScheme) -> Color { raisedSurface(for: scheme) }
-
-    static func shadow(for scheme: ColorScheme) -> Color {
-        scheme == .dark ? Color.black.opacity(0.28) : Color.black.opacity(0.075)
+    static func shadow(for scheme: ColorScheme, appearance: HelloXAppearanceMode? = nil) -> Color {
+        Color.black.opacity(HelloXAppearance.resolved(for: scheme, mode: appearance) == .dark ? 0.2 : 0.06)
     }
 }
 
 enum HelloXIconKey: String, CaseIterable {
     case capture = "crosshair"
+    case dynamicIsland = "panel-top"
     case shortcuts = "command"
     case intelligence = "sparkles"
     case settings = "settings"
@@ -71,10 +201,11 @@ enum HelloXIconKey: String, CaseIterable {
     case scrolling = "scroll-capture"
     case recording = "recording"
     case qrCode = "scan-line"
-    case textRecognition = "scan-text"
+    case colorPicker = "pipette"
+    case textRecognition = "ocr-text"
     case translation = "languages"
+    case selectionTranslation = "highlight"
     case update = "refresh-cw"
-    case arrowRight = "arrow-right"
     case chevronRight = "chevron-right"
     case undo = "undo-2"
     case redo = "redo-2"
@@ -85,70 +216,35 @@ enum HelloXIconKey: String, CaseIterable {
     case pin = "pin"
     case play = "play"
     case add = "plus"
-    case cloud = "cloud"
     case info = "info"
     case warning = "triangle-alert"
     case success = "circle-check"
-    case link = "link"
-    case privacy = "shield-check"
     case rectangle = "square"
+    case highlight = "lightbulb"
     case ellipse = "circle"
     case arrow = "move-up-right"
     case line = "minus"
     case pen = "brush"
-    case edit = "pen-tool"
+    case edit = "edit"
     case text = "type"
+    case step = "list-ordered"
     case watermark = "watermark"
     case pixelate = "mosaic"
     case crop = "crop"
     case document = "file-text"
     case preview = "eye"
+    case search = "search"
 
-    var fallbackSystemName: String {
-        switch self {
-        case .capture: "viewfinder"
-        case .shortcuts: "command"
-        case .intelligence: "sparkles"
-        case .settings: "gearshape"
-        case .window: "macwindow"
-        case .screen: "display"
-        case .scrolling: "arrow.down.to.line.compact"
-        case .recording: "record.circle"
-        case .qrCode: "qrcode.viewfinder"
-        case .textRecognition: "text.viewfinder"
-        case .translation: "character.bubble"
-        case .update: "arrow.triangle.2.circlepath"
-        case .arrowRight: "arrow.right"
-        case .chevronRight: "chevron.right"
-        case .undo: "arrow.uturn.backward"
-        case .redo: "arrow.uturn.forward"
-        case .copy: "doc.on.doc"
-        case .save: "square.and.arrow.down"
-        case .close: "xmark"
-        case .confirm: "checkmark"
-        case .pin: "pin"
-        case .play: "play.fill"
-        case .add: "plus"
-        case .cloud: "cloud"
-        case .info: "info.circle.fill"
-        case .warning: "exclamationmark.triangle.fill"
-        case .success: "checkmark.circle.fill"
-        case .link: "link"
-        case .privacy: "hand.raised"
-        case .rectangle: "rectangle"
-        case .ellipse: "circle"
-        case .arrow: "arrow.up.right"
-        case .line: "line.diagonal"
-        case .pen: "pencil.tip"
-        case .edit: "pencil"
-        case .text: "textformat"
-        case .watermark: "drop"
-        case .pixelate: "square.grid.3x3"
-        case .crop: "crop"
-        case .document: "doc.text"
-        case .preview: "eye"
-        }
-    }
+    case upload = "upload"
+    case spreadsheet = "table"
+    case code = "code"
+    case password = "key"
+    case markdown = "markdown"
+    case chevronUp = "chevron-up"
+    case chevronDown = "chevron-down"
+    case accessibility = "accessibility"
+    case menuBar = "menu-bar"
+    case localTranslation = "local-translation"
 
     var resourceURL: URL? {
         HelloXResourceBundle.bundle.url(forResource: rawValue, withExtension: "svg", subdirectory: "Icons")
@@ -183,11 +279,13 @@ extension AnnotationTool {
         switch self {
         case .select: .capture
         case .rectangle: .rectangle
+        case .highlight: .highlight
         case .ellipse: .ellipse
         case .arrow: .arrow
         case .line: .line
         case .pen: .pen
         case .text: .text
+        case .step: .step
         case .watermark: .watermark
         case .pixelate: .pixelate
         case .crop: .crop
@@ -195,7 +293,38 @@ extension AnnotationTool {
     }
 
     var helloXToolbarHelp: String {
-        self == .watermark ? "添加水印" : localizedName
+        switch self {
+        case .watermark: "添加水印"
+        case .step: "添加步骤说明"
+        default: localizedName
+        }
+    }
+}
+
+/// A single template-image path keeps the original SVG geometry and padding.
+/// Resource coverage is verified for every key, so no surface falls back to a
+/// heavier SF Symbol when an asset is missing.
+@MainActor
+enum HelloXIconImages {
+    private static var cache: [HelloXIconKey: NSImage] = [:]
+
+    static func image(for icon: HelloXIconKey) -> NSImage? {
+        if let image = cache[icon] { return image }
+        guard let url = icon.resourceURL, let image = NSImage(contentsOf: url) else { return nil }
+        image.isTemplate = true
+        cache[icon] = image
+        return image
+    }
+
+    /// Native drawing surfaces use the same vector artwork as SwiftUI.
+    static func tintedImage(for icon: HelloXIconKey, color: NSColor, size: CGFloat) -> NSImage? {
+        guard let source = image(for: icon) else { return nil }
+        return NSImage(size: NSSize(width: size, height: size), flipped: false) { rect in
+            source.draw(in: rect)
+            color.setFill()
+            rect.fill(using: .sourceIn)
+            return true
+        }
     }
 }
 
@@ -205,58 +334,20 @@ struct HelloXIcon: View {
 
     var body: some View {
         Group {
-            if let image = resourceImage {
+            if let image = HelloXIconImages.image(for: icon) ?? HelloXIconImages.image(for: .info) {
                 Image(nsImage: image)
                     .resizable()
                     .renderingMode(.template)
-                    .scaledToFit()
-            } else {
-                Image(systemName: icon.fallbackSystemName)
-                    .resizable()
                     .scaledToFit()
             }
         }
         .frame(width: size, height: size)
         .accessibilityHidden(true)
     }
-
-    private var resourceImage: NSImage? {
-        guard let url = icon.resourceURL,
-              let image = NSImage(contentsOf: url) else { return nil }
-        image.isTemplate = true
-        return image
-    }
-}
-
-struct HelloXGlowBackground: View {
-    @Environment(\.colorScheme) private var colorScheme
-
-    var body: some View {
-        GeometryReader { proxy in
-            ZStack {
-                HelloXTheme.pageBackground(for: colorScheme)
-                RadialGradient(
-                    colors: [HelloXTheme.accent.opacity(colorScheme == .dark ? 0.10 : 0.065), .clear],
-                    center: .topLeading,
-                    startRadius: 10,
-                    endRadius: max(proxy.size.width, proxy.size.height) * 0.62
-                )
-                RadialGradient(
-                    colors: [HelloXTheme.accentBlue.opacity(colorScheme == .dark ? 0.06 : 0.04), .clear],
-                    center: .bottomTrailing,
-                    startRadius: 8,
-                    endRadius: max(proxy.size.width, proxy.size.height) * 0.52
-                )
-            }
-            .clipped()
-        }
-        .allowsHitTesting(false)
-        .accessibilityHidden(true)
-    }
 }
 
 struct HelloXCard<Content: View>: View {
-    var padding: CGFloat = 20
+    var padding: CGFloat = 15
     var cornerRadius: CGFloat = HelloXTheme.cardRadius
     var showsBorder = true
     @ViewBuilder let content: Content
@@ -268,44 +359,23 @@ struct HelloXCard<Content: View>: View {
             .padding(padding)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(HelloXTheme.cardGradient(for: colorScheme), in: shape)
-            .shadow(color: HelloXTheme.shadow(for: colorScheme), radius: 12, y: 6)
-    }
-}
-
-struct HelloXSection<Content: View>: View {
-    let title: String
-    var subtitle: String?
-    var showsBorder = true
-    @ViewBuilder let content: Content
-    @Environment(\.colorScheme) private var colorScheme
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(title)
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(HelloXTheme.primaryText(for: colorScheme))
-                if let subtitle {
-                    Text(subtitle)
-                        .font(.system(size: 11))
-                        .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
+            .overlay {
+                if showsBorder {
+                    shape.stroke(HelloXTheme.border(for: colorScheme), lineWidth: 1)
                 }
             }
-            HelloXCard(showsBorder: showsBorder, content: { content })
-        }
     }
 }
 
 struct HelloXRowIcon: View {
     let icon: HelloXIconKey
-    var size: CGFloat = 38
+    var size: CGFloat = 28.5
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
-        HelloXIcon(icon: icon, size: min(20, size * 0.5))
-            .foregroundStyle(HelloXTheme.accent)
+        HelloXIcon(icon: icon, size: min(16, size))
+            .foregroundStyle(HelloXTheme.iconForeground(for: colorScheme))
             .frame(width: size, height: size)
-            .background(HelloXTheme.selectedBackground(for: colorScheme), in: RoundedRectangle(cornerRadius: HelloXTheme.compactRadius, style: .continuous))
     }
 }
 
@@ -313,6 +383,7 @@ struct HelloXStatusBanner: View {
     enum Kind { case info, success, error }
     let message: String
     var kind: Kind = .info
+    @Environment(\.colorScheme) private var colorScheme
 
     private var color: Color {
         switch kind {
@@ -331,146 +402,60 @@ struct HelloXStatusBanner: View {
     }
 
     var body: some View {
-        HStack(spacing: 9) {
-            HelloXIcon(icon: icon, size: 16)
+        HStack(spacing: 6.75) {
+            HelloXIcon(icon: icon, size: 12)
+                .foregroundStyle(kind == .info ? HelloXTheme.iconForeground(for: colorScheme) : color)
             Text(message)
-                .font(.system(size: 12, weight: .medium))
+                .font(.settingsSystem(size: 11, weight: .medium))
+                .foregroundStyle(color)
         }
-        .foregroundStyle(color)
-        .padding(.horizontal, 14)
-        .padding(.vertical, 11)
+        .padding(.horizontal, 10.5)
+        .padding(.vertical, 8.25)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(color.opacity(0.10), in: RoundedRectangle(cornerRadius: HelloXTheme.controlRadius, style: .continuous))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(message)
     }
 }
 
-private struct HelloXBorderlessFieldModifier: ViewModifier {
-    @Environment(\.colorScheme) private var colorScheme
-
-    func body(content: Content) -> some View {
-        content
-            .padding(.horizontal, 11)
-            .frame(minHeight: 36)
-            .background(
-                HelloXTheme.controlBackground(for: colorScheme),
-                in: RoundedRectangle(cornerRadius: HelloXTheme.controlRadius, style: .continuous)
-            )
-    }
-}
-
-extension View {
-    func helloXBorderlessFieldChrome() -> some View {
-        modifier(HelloXBorderlessFieldModifier())
-    }
-}
-
-struct HelloXFloatingPanel<Content: View>: View {
-    @ViewBuilder let content: Content
-    @Environment(\.colorScheme) private var colorScheme
-
-    var body: some View {
-        let shape = RoundedRectangle(cornerRadius: HelloXTheme.cardRadius, style: .continuous)
-        content
-            .background(HelloXTheme.cardGradient(for: colorScheme), in: shape)
-            .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.38 : 0.16), radius: 24, y: 10)
-    }
-}
-
-enum HelloXButtonRole { case neutral, accent, destructive }
+enum HelloXButtonRole { case neutral, accent, destructive, success, warning }
 
 struct HelloXButtonStyle: ButtonStyle {
+    var isOutlined = false
     var role: HelloXButtonRole = .neutral
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.isEnabled) private var isEnabled
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.isFocused) private var isFocused
+    @State private var isHovered = false
 
     func makeBody(configuration: Configuration) -> some View {
-        let shape = RoundedRectangle(cornerRadius: HelloXTheme.controlRadius, style: .continuous)
+        let primary = role == .accent
         configuration.label
-            .font(.system(size: 12, weight: .semibold))
-            .foregroundStyle(foreground)
-            .padding(.horizontal, 15)
-            .frame(minHeight: HelloXTheme.minimumHitSize)
-            .background(background(isPressed: configuration.isPressed), in: shape)
-            .opacity(isEnabled ? 1 : 0.45)
-            .animation(reduceMotion ? nil : .easeOut(duration: 0.16), value: configuration.isPressed)
-    }
-
-    private var borderColor: Color {
-        switch role {
-        case .accent: .clear
-        case .destructive: HelloXTheme.error.opacity(0.18)
-        case .neutral: HelloXTheme.border(for: colorScheme)
-        }
-    }
-
-    private var foreground: Color {
-        switch role {
-        case .accent: .white
-        case .destructive: HelloXTheme.error
-        case .neutral: HelloXTheme.primaryText(for: colorScheme)
-        }
-    }
-
-    private func background(isPressed: Bool) -> AnyShapeStyle {
-        switch role {
-        case .accent:
-            if isPressed { AnyShapeStyle(HelloXTheme.accentPressed) }
-            else { AnyShapeStyle(HelloXTheme.accentGradient) }
-        case .destructive:
-            AnyShapeStyle(HelloXTheme.error.opacity(isPressed ? 0.18 : 0.10))
-        case .neutral:
-            AnyShapeStyle(isPressed ? HelloXTheme.selectedBackground(for: colorScheme) : HelloXTheme.controlBackground(for: colorScheme))
-        }
-    }
-}
-
-enum HelloXUtilityButtonMetrics {
-    static let width: CGFloat = 88
-    static let height: CGFloat = 34
-    static let fontSize: CGFloat = 11.5
-}
-
-struct HelloXUtilityButtonLabel: View {
-    let title: String
-    var role: HelloXButtonRole = .neutral
-    @Environment(\.colorScheme) private var colorScheme
-
-    var body: some View {
-        let shape = RoundedRectangle(cornerRadius: HelloXTheme.controlRadius, style: .continuous)
-        Text(title)
-            .font(.system(size: HelloXUtilityButtonMetrics.fontSize, weight: .semibold))
-            .foregroundStyle(foreground)
-            .lineLimit(1)
-            .frame(
-                width: HelloXUtilityButtonMetrics.width,
-                height: HelloXUtilityButtonMetrics.height
-            )
-            .background(background, in: shape)
-    }
-
-    private var foreground: Color {
-        switch role {
-        case .neutral: HelloXTheme.secondaryText(for: colorScheme)
-        case .accent: .white
-        case .destructive: HelloXTheme.error
-        }
-    }
-
-    private var background: Color {
-        switch role {
-        case .neutral: HelloXTheme.controlBackground(for: colorScheme)
-        case .accent: HelloXTheme.accent
-        case .destructive: HelloXTheme.error.opacity(0.10)
-        }
-    }
-
-    private var borderColor: Color {
-        switch role {
-        case .neutral: HelloXTheme.border(for: colorScheme)
-        case .accent: .clear
-        case .destructive: HelloXTheme.error.opacity(0.18)
-        }
+            .font(HXTypography.control)
+            .foregroundStyle(!isEnabled ? HelloXTheme.disabledForeground(for: colorScheme)
+                : primary ? HelloXTheme.prominentForeground
+                : role == .destructive ? HelloXTheme.error : HelloXTheme.primaryText(for: colorScheme))
+            .padding(.horizontal, 12)
+            .frame(minHeight: 28)
+            .background(!isEnabled ? HelloXTheme.disabledBackground(for: colorScheme) : primary
+                ? (configuration.isPressed ? HelloXTheme.buttonPressed : isHovered ? HelloXTheme.buttonHovered : HelloXTheme.buttonBackground)
+                : isOutlined ? HelloXTheme.raisedSurface(for: colorScheme) : HelloXTheme.controlBackground(for: colorScheme))
+            .overlay {
+                if isOutlined || !isEnabled {
+                    RoundedRectangle(cornerRadius: 10).strokeBorder(
+                        isEnabled ? HelloXTheme.border(for: colorScheme) : HelloXTheme.disabledBorder(for: colorScheme), lineWidth: 1)
+                }
+            }
+            .overlay {
+                if isEnabled && !primary && (isHovered || configuration.isPressed) {
+                    HelloXTheme.hoverBackground(for: colorScheme).allowsHitTesting(false)
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 10))
+            .overlay {
+                if isEnabled && isFocused { RoundedRectangle(cornerRadius: 10).strokeBorder(HelloXTheme.focusRing, lineWidth: 2) }
+            }
+            .onHover { isHovered = isEnabled && $0 }
     }
 }
 
@@ -482,14 +467,12 @@ struct HelloXUtilityTextButton: View {
     @Environment(\.isEnabled) private var isEnabled
 
     var body: some View {
-        Button(action: action) {
-            HelloXUtilityButtonLabel(title: title, role: role)
-        }
-        .buttonStyle(.plain)
-        .opacity(isEnabled ? 1 : 0.42)
-        .help(help)
-        .accessibilityLabel(help)
+        Button(title, action: action)
+            .buttonStyle(HelloXButtonStyle(role: role))
+            .help(help)
+            .accessibilityLabel(help)
     }
+
 }
 
 struct HelloXIconButton: View {
@@ -499,12 +482,14 @@ struct HelloXIconButton: View {
     var role: HelloXButtonRole = .neutral
     var size: CGFloat = HelloXTheme.minimumHitSize
     var iconSize: CGFloat = HelloXTheme.iconMedium
-    var isBorderless = false
+    var isBorderless = true
     var usesWhiteBackground = false
+    var usesPureWhiteIconInDarkMode = false
     var onHoverChange: ((Bool) -> Void)?
     let action: () -> Void
 
     @State private var isHovered = false
+    @Environment(\.isEnabled) private var isEnabled
 
     var body: some View {
         Button(action: action) {
@@ -516,13 +501,20 @@ struct HelloXIconButton: View {
             isHovered: isHovered,
             role: role,
             isBorderless: isBorderless,
-            usesWhiteBackground: usesWhiteBackground
+            usesWhiteBackground: usesWhiteBackground,
+            usesPureWhiteIconInDarkMode: usesPureWhiteIconInDarkMode
         ))
         .help(help)
         .accessibilityLabel(help)
         .onHover { hovering in
-            isHovered = hovering
-            onHoverChange?(hovering)
+            isHovered = isEnabled && hovering
+            onHoverChange?(isHovered)
+        }
+        .onChange(of: isEnabled) { _, enabled in
+            if !enabled {
+                isHovered = false
+                onHoverChange?(false)
+            }
         }
     }
 }
@@ -533,209 +525,54 @@ private struct HelloXIconButtonStyle: ButtonStyle {
     let role: HelloXButtonRole
     let isBorderless: Bool
     let usesWhiteBackground: Bool
+    let usesPureWhiteIconInDarkMode: Bool
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.isEnabled) private var isEnabled
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.isFocused) private var isFocused
 
     func makeBody(configuration: Configuration) -> some View {
-        let shape = RoundedRectangle(cornerRadius: HelloXTheme.controlRadius, style: .continuous)
+        let shape = RoundedRectangle(cornerRadius: HelloXTheme.compactRadius)
         configuration.label
             .foregroundStyle(foreground)
             .background(background(isPressed: configuration.isPressed), in: shape)
-            .shadow(color: hoverShadow, radius: isHovered && !isBorderless ? 5 : 0, y: isHovered && !isBorderless ? 2 : 0)
-            .opacity(isEnabled ? 1 : 0.42)
-            .animation(reduceMotion ? nil : .easeOut(duration: 0.16), value: configuration.isPressed)
-            .animation(reduceMotion ? nil : .easeOut(duration: 0.06), value: isHovered)
+            .overlay {
+                shape.stroke(
+                    isEnabled && isFocused ? HelloXTheme.focusRing : borderColor,
+                    lineWidth: isEnabled && isFocused ? 2 : ((!isEnabled && hasDisabledBackground) || !isBorderless ? 1 : 0)
+                )
+            }
     }
 
     private var borderColor: Color {
-        if role == .destructive { return HelloXTheme.error.opacity(0.18) }
-        return HelloXTheme.border(for: colorScheme)
+        if !isEnabled { return hasDisabledBackground ? HelloXTheme.disabledBorder(for: colorScheme) : .clear }
+        return isBorderless ? .clear : HelloXTheme.border(for: colorScheme)
+    }
+
+    private var hasDisabledBackground: Bool {
+        !isBorderless || usesWhiteBackground || isSelected || role == .accent
     }
 
     private var foreground: Color {
-        if isSelected || role == .accent { return .white }
-        if role == .destructive { return HelloXTheme.error }
-        if usesWhiteBackground {
-            return isHovered ? HelloXTheme.accentBlue : Color(red: 0.28, green: 0.33, blue: 0.40)
-        }
-        if isHovered { return HelloXTheme.accentBlue }
-        return HelloXTheme.secondaryText(for: colorScheme)
+        if !isEnabled { return HelloXTheme.disabledForeground(for: colorScheme) }
+        if role == .accent { return HelloXTheme.prominentForeground }
+        if usesPureWhiteIconInDarkMode, colorScheme == .dark { return .white }
+        if role == .destructive, isHovered { return HelloXTheme.error }
+        return HelloXTheme.iconForeground(for: colorScheme)
     }
 
     private func background(isPressed: Bool) -> AnyShapeStyle {
-        if isSelected || role == .accent {
-            if isPressed { return AnyShapeStyle(HelloXTheme.accentPressed) }
-            return AnyShapeStyle(HelloXTheme.accentGradient)
+        if !isEnabled {
+            return AnyShapeStyle(hasDisabledBackground ? HelloXTheme.disabledBackground(for: colorScheme) : .clear)
         }
-        if usesWhiteBackground {
-            if role == .destructive, isPressed || isHovered {
-                return AnyShapeStyle(
-                    isPressed
-                        ? Color(red: 1.00, green: 0.88, blue: 0.88)
-                        : Color(red: 1.00, green: 0.94, blue: 0.94)
-                )
-            }
-            return AnyShapeStyle(isPressed ? Color(red: 0.94, green: 0.96, blue: 0.98) : Color.white)
+        if role == .accent {
+            return AnyShapeStyle(isPressed ? HelloXTheme.buttonPressed
+                : isHovered ? HelloXTheme.buttonHovered : HelloXTheme.buttonBackground)
         }
-        if role == .destructive {
-            return AnyShapeStyle(HelloXTheme.error.opacity(isPressed ? 0.22 : (isHovered ? 0.17 : 0.11)))
-        }
-        if isPressed || isHovered {
-            return AnyShapeStyle(HelloXTheme.selectedBackground(for: colorScheme))
-        }
-        if isBorderless { return AnyShapeStyle(Color.clear) }
+        if isPressed { return AnyShapeStyle(HelloXTheme.pressedBackground(for: colorScheme)) }
+        if isSelected { return AnyShapeStyle(HelloXTheme.selectedBackground(for: colorScheme)) }
+        if isHovered { return AnyShapeStyle(HelloXTheme.hoverBackground(for: colorScheme)) }
+        if isBorderless && !usesWhiteBackground { return AnyShapeStyle(Color.clear) }
         return AnyShapeStyle(HelloXTheme.controlBackground(for: colorScheme))
     }
 
-    private var hoverShadow: Color {
-        if role == .destructive { return HelloXTheme.error.opacity(0.16) }
-        return HelloXTheme.accentBlue.opacity(0.18)
-    }
-}
-
-private struct SeamlessTextEditorScrollChrome: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSView {
-        let marker = ScrollChromeMarkerView(frame: .zero)
-        DispatchQueue.main.async { configureScrollView(around: marker) }
-        return marker
-    }
-
-    func updateNSView(_ marker: NSView, context: Context) {
-        DispatchQueue.main.async { configureScrollView(around: marker) }
-    }
-
-    private func configureScrollView(around marker: NSView) {
-        guard let root = marker.window?.contentView else { return }
-        let markerPoint = marker.convert(
-            CGPoint(x: marker.bounds.midX, y: marker.bounds.midY),
-            to: nil
-        )
-        guard let scrollView = scrollViews(in: root)
-            .filter({ $0.convert($0.bounds, to: nil).contains(markerPoint) })
-            .min(by: { $0.bounds.width * $0.bounds.height < $1.bounds.width * $1.bounds.height })
-        else { return }
-
-        scrollView.scrollerStyle = .overlay
-        scrollView.autohidesScrollers = true
-        scrollView.hasVerticalScroller = false
-        scrollView.hasHorizontalScroller = false
-        scrollView.borderType = .noBorder
-        scrollView.drawsBackground = false
-        scrollView.backgroundColor = .clear
-    }
-
-    private func scrollViews(in view: NSView) -> [NSScrollView] {
-        view.subviews.reduce(into: view is NSScrollView ? [view as! NSScrollView] : []) { result, child in
-            result.append(contentsOf: scrollViews(in: child))
-        }
-    }
-}
-
-final class HelloXOverlayScroller: NSScroller {
-    private var isHovered = false
-    private var hoverTrackingArea: NSTrackingArea?
-
-    override func drawKnobSlot(in slotRect: NSRect, highlight flag: Bool) {}
-
-    override func drawKnob() {
-        let knobRect = rect(for: .knob).insetBy(dx: 4, dy: 1)
-        guard knobRect.width > 0, knobRect.height > 0 else { return }
-        let opacity: CGFloat = isHovered || isHighlighted ? 0.42 : 0.16
-        NSColor.labelColor.withAlphaComponent(opacity).setFill()
-        NSBezierPath(
-            roundedRect: knobRect,
-            xRadius: knobRect.width / 2,
-            yRadius: knobRect.width / 2
-        ).fill()
-    }
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let hoverTrackingArea { removeTrackingArea(hoverTrackingArea) }
-        let trackingArea = NSTrackingArea(
-            rect: bounds,
-            options: [.mouseEnteredAndExited, .activeInActiveApp],
-            owner: self,
-            userInfo: nil
-        )
-        addTrackingArea(trackingArea)
-        hoverTrackingArea = trackingArea
-    }
-
-    override func mouseEntered(with event: NSEvent) {
-        isHovered = true
-        needsDisplay = true
-        super.mouseEntered(with: event)
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        isHovered = false
-        needsDisplay = true
-        super.mouseExited(with: event)
-    }
-}
-
-private struct VisibleScrollChrome: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSView {
-        let marker = ScrollChromeMarkerView(frame: .zero)
-        DispatchQueue.main.async { configureScrollView(around: marker) }
-        return marker
-    }
-
-    func updateNSView(_ marker: NSView, context: Context) {
-        DispatchQueue.main.async { configureScrollView(around: marker) }
-    }
-
-    private func configureScrollView(around marker: NSView) {
-        guard let root = marker.window?.contentView else { return }
-        let markerPoint = marker.convert(
-            CGPoint(x: marker.bounds.midX, y: marker.bounds.midY),
-            to: nil
-        )
-        guard let scrollView = scrollViews(in: root)
-            .filter({ $0.convert($0.bounds, to: nil).contains(markerPoint) })
-            .min(by: { $0.bounds.width * $0.bounds.height < $1.bounds.width * $1.bounds.height })
-        else { return }
-
-        scrollView.scrollerStyle = .overlay
-        scrollView.autohidesScrollers = false
-        scrollView.hasVerticalScroller = true
-        scrollView.borderType = .noBorder
-        scrollView.drawsBackground = false
-        scrollView.backgroundColor = .clear
-        scrollView.contentView.drawsBackground = false
-        scrollView.contentView.backgroundColor = .clear
-        scrollView.hasHorizontalScroller = false
-        if scrollView.verticalScroller is HelloXOverlayScroller == false {
-            scrollView.verticalScroller = HelloXOverlayScroller(frame: .zero)
-        }
-        scrollView.verticalScroller?.isHidden = false
-    }
-
-    private func scrollViews(in view: NSView) -> [NSScrollView] {
-        view.subviews.reduce(into: view is NSScrollView ? [view as! NSScrollView] : []) { result, child in
-            result.append(contentsOf: scrollViews(in: child))
-        }
-    }
-}
-
-final class ScrollChromeMarkerView: NSView {
-    override func hitTest(_ point: NSPoint) -> NSView? { nil }
-}
-
-extension View {
-    func seamlessTextEditorChrome() -> some View {
-        scrollIndicators(.hidden)
-            .background(SeamlessTextEditorScrollChrome())
-    }
-
-    func seamlessScrollChrome() -> some View {
-        background(SeamlessTextEditorScrollChrome())
-    }
-
-    func visibleScrollChrome() -> some View {
-        scrollIndicators(.visible)
-            .background(VisibleScrollChrome())
-    }
 }

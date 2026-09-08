@@ -6,11 +6,13 @@ public enum AnnotationTool: String, CaseIterable, Sendable, Identifiable {
     case select
     case crop
     case rectangle
+    case highlight
     case ellipse
     case arrow
     case line
     case pen
     case text
+    case step
     case watermark
     case pixelate
 
@@ -21,33 +23,208 @@ public enum AnnotationTool: String, CaseIterable, Sendable, Identifiable {
         case .select: "选择"
         case .crop: "裁剪"
         case .rectangle: "矩形"
+        case .highlight: "高亮"
         case .ellipse: "椭圆"
         case .arrow: "箭头"
         case .line: "直线"
         case .pen: "画笔"
         case .text: "文字"
+        case .step: "步骤"
         case .watermark: "水印"
         case .pixelate: "马赛克"
         }
     }
 
-    public var systemImage: String {
+    public var isTextual: Bool {
+        self == .text || self == .step || self == .watermark
+    }
+}
+
+public enum StepAnnotationNumbering {
+    public static func number(for annotationID: UUID, in annotations: [Annotation]) -> Int? {
+        var number = 0
+        for annotation in annotations where annotation.tool == .step {
+            number += 1
+            if annotation.id == annotationID { return number }
+        }
+        return nil
+    }
+}
+
+public enum AnnotationTypography {
+    public static let minimumFontSize: CGFloat = 10
+}
+
+public enum AnnotationHighlightStyle {
+    public static let dimOpacity: CGFloat = 0.50
+    public static let defaultColor = RGBAColor(
+        red: 1,
+        green: 0.82,
+        blue: 0.12
+    )
+}
+
+public enum AnnotationHighlightShape: String, CaseIterable, Sendable, Identifiable {
+    case rectangle
+    case ellipse
+
+    public var id: String { rawValue }
+
+    public var localizedName: String {
         switch self {
-        case .select: "cursorarrow"
-        case .crop: "crop"
-        case .rectangle: "rectangle"
-        case .ellipse: "circle"
-        case .arrow: "arrow.up.right"
-        case .line: "line.diagonal"
-        case .pen: "pencil.tip"
-        case .text: "textformat"
-        case .watermark: "drop"
-        case .pixelate: "square.grid.3x3"
+        case .rectangle: "矩形"
+        case .ellipse: "椭圆"
         }
     }
+}
 
-    public var isTextual: Bool {
-        self == .text || self == .watermark
+public struct StepAnnotationLayoutMetrics: Equatable, Sendable {
+    public let bounds: CGRect
+    public let badgeRect: CGRect
+    public let cardRect: CGRect
+    public let textRect: CGRect
+    public let connectorStart: CGPoint
+    public let connectorEnd: CGPoint
+
+    public init(
+        bounds: CGRect,
+        badgeRect: CGRect,
+        cardRect: CGRect,
+        textRect: CGRect,
+        connectorStart: CGPoint,
+        connectorEnd: CGPoint
+    ) {
+        self.bounds = bounds
+        self.badgeRect = badgeRect
+        self.cardRect = cardRect
+        self.textRect = textRect
+        self.connectorStart = connectorStart
+        self.connectorEnd = connectorEnd
+    }
+}
+
+public enum StepAnnotationLayout {
+    public static let defaultCardWidth: CGFloat = 220
+    public static let minimumCardWidth: CGFloat = 120
+    public static let badgeGap: CGFloat = 6
+    public static let horizontalPadding: CGFloat = 10
+    public static let verticalPadding: CGFloat = 6
+    public static let cornerRadius: CGFloat = 5
+
+    public static func layout(
+        text: String,
+        number: Int,
+        origin: CGPoint,
+        totalWidth: CGFloat,
+        fontSize: CGFloat,
+        badgeOnTrailingEdge: Bool = false,
+        badgeCenter: CGPoint? = nil
+    ) -> StepAnnotationLayoutMetrics {
+        let resolvedFontSize = max(8, fontSize)
+        let textFont = NSFont.systemFont(ofSize: resolvedFontSize, weight: .medium)
+        let numberFont = NSFont.systemFont(ofSize: resolvedFontSize, weight: .bold)
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = .byWordWrapping
+        paragraph.alignment = .left
+        let textAttributes: [NSAttributedString.Key: Any] = [
+            .font: textFont,
+            .paragraphStyle: paragraph
+        ]
+        let numberSize = (String(number) as NSString).size(withAttributes: [.font: numberFont])
+        let lineHeight = ceil(textFont.ascender - textFont.descender + textFont.leading)
+        let badgeHeight = ceil(lineHeight + verticalPadding * 2)
+        let badgeWidth = max(badgeHeight, ceil(numberSize.width + horizontalPadding))
+        let availableCardWidth = max(
+            minimumCardWidth,
+            totalWidth - badgeWidth - badgeGap
+        )
+        let contentWidth = max(1, availableCardWidth - horizontalPadding * 2)
+        let measuredText = ((text.isEmpty ? " " : text) as NSString).boundingRect(
+            with: CGSize(width: contentWidth, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: textAttributes
+        ).integral.size
+        let cardHeight = max(
+            badgeHeight,
+            ceil(measuredText.height) + verticalPadding * 2
+        )
+        let cardRect: CGRect
+        var badgeRect: CGRect
+        if badgeOnTrailingEdge {
+            cardRect = CGRect(
+                x: origin.x,
+                y: origin.y,
+                width: availableCardWidth,
+                height: cardHeight
+            )
+            badgeRect = CGRect(
+                x: cardRect.maxX + badgeGap,
+                y: origin.y,
+                width: badgeWidth,
+                height: badgeHeight
+            )
+        } else {
+            badgeRect = CGRect(
+                x: origin.x,
+                y: origin.y,
+                width: badgeWidth,
+                height: badgeHeight
+            )
+            cardRect = CGRect(
+                x: badgeRect.maxX + badgeGap,
+                y: origin.y,
+                width: availableCardWidth,
+                height: cardHeight
+            )
+        }
+        if let badgeCenter {
+            badgeRect.origin = CGPoint(
+                x: badgeCenter.x - badgeRect.width / 2,
+                y: badgeCenter.y - badgeRect.height / 2
+            )
+        }
+        let textRect = cardRect.insetBy(dx: horizontalPadding, dy: verticalPadding)
+        let badgeCenter = CGPoint(x: badgeRect.midX, y: badgeRect.midY)
+        return StepAnnotationLayoutMetrics(
+            bounds: badgeRect.union(cardRect),
+            badgeRect: badgeRect,
+            cardRect: cardRect,
+            textRect: textRect,
+            connectorStart: badgeCenter,
+            connectorEnd: connectorPoint(on: cardRect, toward: badgeCenter)
+        )
+    }
+
+    /// Intersects the ray from the card center toward the badge with one of the
+    /// card's four edges. The attachment edge changes as the badge moves around it.
+    private static func connectorPoint(on rect: CGRect, toward point: CGPoint) -> CGPoint {
+        let halfWidth = rect.width / 2
+        let halfHeight = rect.height / 2
+        guard halfWidth > 0, halfHeight > 0 else {
+            return CGPoint(x: rect.midX, y: rect.midY)
+        }
+
+        let dx = point.x - rect.midX
+        let dy = point.y - rect.midY
+        guard dx != 0 || dy != 0 else {
+            return CGPoint(x: rect.minX, y: rect.midY)
+        }
+
+        let horizontalRatio = abs(dx) / halfWidth
+        let verticalRatio = abs(dy) / halfHeight
+        if horizontalRatio >= verticalRatio {
+            let scale = halfWidth / abs(dx)
+            return CGPoint(
+                x: dx < 0 ? rect.minX : rect.maxX,
+                y: rect.midY + dy * scale
+            )
+        }
+
+        let scale = halfHeight / abs(dy)
+        return CGPoint(
+            x: rect.midX + dx * scale,
+            y: dy < 0 ? rect.minY : rect.maxY
+        )
     }
 }
 
@@ -113,6 +290,12 @@ public struct Annotation: Equatable, Sendable, Identifiable {
     public var mosaicBlockSize: CGFloat
     /// Gap between tiled watermark labels in source image pixels.
     public var watermarkSpacing: CGFloat
+    /// Optional independently positioned center of a step number badge.
+    public var stepBadgePosition: CGPoint?
+    /// Whether a spotlight highlight draws an explicit border around its clear area.
+    public var highlightShowsBorder: Bool
+    /// Shape of the clear spotlight area and its optional border.
+    public var highlightShape: AnnotationHighlightShape
 
     public init(
         id: UUID = UUID(),
@@ -125,7 +308,10 @@ public struct Annotation: Equatable, Sendable, Identifiable {
         lineWidth: CGFloat = 4,
         mosaicMode: MosaicMode = .rectangle,
         mosaicBlockSize: CGFloat? = nil,
-        watermarkSpacing: CGFloat = 48
+        watermarkSpacing: CGFloat = 48,
+        stepBadgePosition: CGPoint? = nil,
+        highlightShowsBorder: Bool = false,
+        highlightShape: AnnotationHighlightShape = .rectangle
     ) {
         self.id = id
         self.tool = tool
@@ -138,6 +324,9 @@ public struct Annotation: Equatable, Sendable, Identifiable {
         self.mosaicMode = mosaicMode
         self.mosaicBlockSize = mosaicBlockSize ?? max(6, lineWidth * 2)
         self.watermarkSpacing = watermarkSpacing
+        self.stepBadgePosition = stepBadgePosition
+        self.highlightShowsBorder = highlightShowsBorder
+        self.highlightShape = highlightShape
     }
 
     public var normalizedRect: CGRect {
@@ -159,12 +348,14 @@ public struct Annotation: Equatable, Sendable, Identifiable {
                 height: maximumY - minimumY
             )
         }
-        return CGRect(
+        let rect = CGRect(
             x: min(start.x, end.x),
             y: min(start.y, end.y),
             width: abs(end.x - start.x),
             height: abs(end.y - start.y)
         )
+        guard tool == .step, let stepBadgePosition else { return rect }
+        return rect.union(CGRect(origin: stepBadgePosition, size: .zero))
     }
 }
 
@@ -176,25 +367,36 @@ public enum AnnotationRenderer {
         baseImage: CGImage,
         annotations: [Annotation],
         normalizedCrop: CGRect?,
-        translatedBlocks: [ImageTranslationBlock] = []
+        replacementBaseImage: CGImage? = nil,
+        screenshotTranslationBlocks: [ScreenshotTranslationBlock] = []
     ) throws -> CGImage {
         guard let normalizedCrop else {
-            return annotations.isEmpty && translatedBlocks.isEmpty
-                ? baseImage
-                : try render(baseImage: baseImage, annotations: annotations, translatedBlocks: translatedBlocks)
+            let outputBaseImage = replacementBaseImage ?? baseImage
+            return annotations.isEmpty && screenshotTranslationBlocks.isEmpty
+                ? outputBaseImage
+                : try render(
+                    baseImage: outputBaseImage,
+                    annotations: annotations,
+                    screenshotTranslationBlocks: screenshotTranslationBlocks
+                )
         }
         let crop = normalizedCrop.standardized.intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
         guard crop.width > 0, crop.height > 0 else { throw HelloXError.captureFailed("裁剪区域太小") }
-        let croppedImage = try self.crop(baseImage: baseImage, normalizedRect: crop)
+        let croppedImage = try replacementBaseImage
+            ?? self.crop(baseImage: baseImage, normalizedRect: crop)
         let rebased = annotations.compactMap { rebase($0, into: crop) }
-        guard !rebased.isEmpty || !translatedBlocks.isEmpty else { return croppedImage }
-        return try render(baseImage: croppedImage, annotations: rebased, translatedBlocks: translatedBlocks)
+        guard !rebased.isEmpty || !screenshotTranslationBlocks.isEmpty else { return croppedImage }
+        return try render(
+            baseImage: croppedImage,
+            annotations: rebased,
+            screenshotTranslationBlocks: screenshotTranslationBlocks
+        )
     }
 
     public static func render(
         baseImage: CGImage,
         annotations: [Annotation],
-        translatedBlocks: [ImageTranslationBlock] = []
+        screenshotTranslationBlocks: [ScreenshotTranslationBlock] = []
     ) throws -> CGImage {
         // Render into a bitmap context with the exact source pixel dimensions.
         // Using NSImage.lockFocus here lets AppKit choose a backing scale (usually
@@ -231,8 +433,15 @@ public enum AnnotationRenderer {
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = graphicsContext
 
+        ScreenshotTranslationDrawing.draw(
+            screenshotTranslationBlocks,
+            in: CGRect(origin: .zero, size: size),
+            sourceImageSize: size
+        )
         var pixelationCache: [Int: CGImage] = [:]
+        var stepNumber = 0
         for annotation in annotations where annotation.tool != .crop && annotation.tool != .select {
+            if annotation.tool == .step { stepNumber += 1 }
             if annotation.tool == .pixelate {
                 drawPixelation(
                     baseImage: baseImage,
@@ -241,10 +450,13 @@ public enum AnnotationRenderer {
                     cache: &pixelationCache
                 )
             } else {
-                drawVector(annotation, size: size)
+                drawVector(
+                    annotation,
+                    size: size,
+                    stepNumber: annotation.tool == .step ? stepNumber : nil
+                )
             }
         }
-        drawTranslatedTextBlocks(translatedBlocks, size: size)
         NSGraphicsContext.restoreGraphicsState()
         context.restoreGState()
         guard let output = context.makeImage() else {
@@ -255,12 +467,15 @@ public enum AnnotationRenderer {
 
     public static func crop(baseImage: CGImage, normalizedRect: CGRect) throws -> CGImage {
         let bounded = normalizedRect.standardized.intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
-        let pixelRect = CGRect(
+        // Public normalized rectangles use the editor's top-left origin, and
+        // CGImage.cropping(to:) measures its rect from the image's top-left
+        // corner as well, so no vertical flip is applied here.
+        let pixelRect = expandingPixelRect(
             x: bounded.minX * CGFloat(baseImage.width),
             y: bounded.minY * CGFloat(baseImage.height),
             width: bounded.width * CGFloat(baseImage.width),
             height: bounded.height * CGFloat(baseImage.height)
-        ).integral
+        )
         guard pixelRect.width >= 2, pixelRect.height >= 2,
               let image = baseImage.cropping(to: pixelRect) else {
             throw HelloXError.captureFailed("裁剪区域太小")
@@ -289,6 +504,7 @@ public enum AnnotationRenderer {
         result.start = point(annotation.start)
         result.end = point(annotation.end)
         result.points = annotation.points.map(point)
+        result.stepBadgePosition = annotation.stepBadgePosition.map(point)
         if result.tool == .pixelate {
             result.start.x = min(1, max(0, result.start.x))
             result.start.y = min(1, max(0, result.start.y))
@@ -298,7 +514,11 @@ public enum AnnotationRenderer {
         return result
     }
 
-    private static func drawVector(_ annotation: Annotation, size: NSSize) {
+    private static func drawVector(
+        _ annotation: Annotation,
+        size: NSSize,
+        stepNumber: Int?
+    ) {
         let start = point(annotation.start, size: size)
         let end = point(annotation.end, size: size)
         annotation.color.nsColor.setStroke()
@@ -312,13 +532,37 @@ public enum AnnotationRenderer {
         case .rectangle:
             path.appendRect(rect(annotation.normalizedRect, size: size))
             path.stroke()
+        case .highlight:
+            let highlightRect = rect(annotation.normalizedRect, size: size)
+            path.appendRect(CGRect(origin: .zero, size: size))
+            switch annotation.highlightShape {
+            case .rectangle: path.appendRect(highlightRect)
+            case .ellipse: path.appendOval(in: highlightRect)
+            }
+            path.windingRule = .evenOdd
+            NSColor.black
+                .withAlphaComponent(AnnotationHighlightStyle.dimOpacity)
+                .setFill()
+            path.fill()
+            if annotation.highlightShowsBorder {
+                let border: NSBezierPath
+                switch annotation.highlightShape {
+                case .rectangle: border = NSBezierPath(rect: highlightRect)
+                case .ellipse: border = NSBezierPath(ovalIn: highlightRect)
+                }
+                border.lineWidth = max(1, annotation.lineWidth)
+                annotation.color.nsColor.setStroke()
+                border.stroke()
+            }
         case .ellipse:
             path.appendOval(in: rect(annotation.normalizedRect, size: size))
             path.stroke()
         case .line:
             path.move(to: start); path.line(to: end); path.stroke()
         case .arrow:
-            path.move(to: start); path.line(to: end); path.stroke()
+            path.move(to: start)
+            path.line(to: arrowShaftEnd(from: start, to: end, lineWidth: annotation.lineWidth))
+            path.stroke()
             drawArrowHead(from: start, to: end, lineWidth: annotation.lineWidth)
         case .pen:
             let points = annotation.points.map { point($0, size: size) }
@@ -326,8 +570,14 @@ public enum AnnotationRenderer {
             path.move(to: first)
             for point in points.dropFirst() { path.line(to: point) }
             path.stroke()
+        case .step:
+            drawStep(
+                annotation,
+                number: stepNumber ?? 1,
+                size: size
+            )
         case .text, .watermark:
-            let fontSize = max(14, annotation.lineWidth * 5)
+            let fontSize = max(AnnotationTypography.minimumFontSize, annotation.lineWidth * 5)
             let baseFont = NSFont.systemFont(ofSize: fontSize, weight: .medium)
             let font = annotation.tool == .watermark
                 ? NSFontManager.shared.convert(baseFont, toHaveTrait: .italicFontMask)
@@ -366,47 +616,72 @@ public enum AnnotationRenderer {
         }
     }
 
-    private static func drawTranslatedTextBlocks(_ blocks: [ImageTranslationBlock], size: NSSize) {
-        for block in blocks where !block.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            let box = block.boundingBox.standardized.intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
-            guard box.width > 0, box.height > 0 else { continue }
-            let rect = CGRect(
-                x: box.minX * size.width,
-                y: (1 - box.maxY) * size.height,
-                width: box.width * size.width,
-                height: box.height * size.height
-            ).integral
-            guard rect.width >= 2, rect.height >= 2 else { continue }
+    private static func drawStep(_ annotation: Annotation, number: Int, size: NSSize) {
+        let start = point(annotation.start, size: size)
+        let end = point(annotation.end, size: size)
+        let badgeOnTrailingEdge = end.x < start.x
+        let origin = CGPoint(x: min(start.x, end.x), y: start.y)
+        let totalWidth = max(
+            StepAnnotationLayout.minimumCardWidth,
+            abs(end.x - start.x)
+        )
+        let fontSize = max(AnnotationTypography.minimumFontSize, annotation.lineWidth * 5)
+        let layout = StepAnnotationLayout.layout(
+            text: annotation.text,
+            number: number,
+            origin: origin,
+            totalWidth: totalWidth,
+            fontSize: fontSize,
+            badgeOnTrailingEdge: badgeOnTrailingEdge,
+            badgeCenter: annotation.stepBadgePosition.map { point($0, size: size) }
+        )
+        let connector = NSBezierPath()
+        connector.move(to: layout.connectorStart)
+        connector.line(to: layout.connectorEnd)
+        connector.lineWidth = max(1.5, annotation.lineWidth)
+        connector.lineCapStyle = .round
+        annotation.color.nsColor.setStroke()
+        connector.stroke()
+        annotation.color.nsColor.setFill()
+        NSBezierPath(
+            roundedRect: layout.badgeRect,
+            xRadius: layout.badgeRect.height / 2,
+            yRadius: layout.badgeRect.height / 2
+        ).fill()
+        NSColor(srgbRed: 0.38, green: 0.38, blue: 0.38, alpha: 0.92).setFill()
+        NSBezierPath(
+            roundedRect: layout.cardRect,
+            xRadius: StepAnnotationLayout.cornerRadius,
+            yRadius: StepAnnotationLayout.cornerRadius
+        ).fill()
 
-            let appearance = block.appearance
-            let fittedFontSize = ImageTranslationTextLayout.fittedFontSize(
-                for: block.text,
-                in: rect,
-                preferredSize: appearance.fontSize
-            )
-            let fontSize = fittedFontSize * ImageTranslationTextLayout.forcedFontScale
-            let horizontalPadding = max(2, fontSize * 0.16)
-            let verticalPadding = max(1, fontSize * 0.10)
-            let paragraph = NSMutableParagraphStyle()
-            paragraph.lineBreakMode = .byClipping
-            paragraph.alignment = .left
-            let font = NSFont.systemFont(ofSize: fontSize, weight: .regular)
-            let lineHeight = ceil(font.ascender - font.descender + font.leading)
-            paragraph.minimumLineHeight = lineHeight
-            paragraph.maximumLineHeight = lineHeight
-            let attributes: [NSAttributedString.Key: Any] = [
-                .font: font,
-                .foregroundColor: appearance.foregroundColor.nsColor,
+        let numberFont = NSFont.systemFont(ofSize: fontSize, weight: .bold)
+        let numberText = String(number) as NSString
+        let numberSize = numberText.size(withAttributes: [.font: numberFont])
+        numberText.draw(
+            at: CGPoint(
+                x: layout.badgeRect.midX - numberSize.width / 2,
+                y: layout.badgeRect.midY - numberSize.height / 2
+            ),
+            withAttributes: [
+                .font: numberFont,
+                .foregroundColor: NSColor.white
+            ]
+        )
+
+        guard !annotation.text.isEmpty else { return }
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = .byWordWrapping
+        paragraph.alignment = .left
+        (annotation.text as NSString).draw(
+            with: layout.textRect,
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: [
+                .font: NSFont.systemFont(ofSize: fontSize, weight: .medium),
+                .foregroundColor: NSColor.white,
                 .paragraphStyle: paragraph
             ]
-            appearance.backgroundColor.nsColor.setFill()
-            NSBezierPath(rect: rect).fill()
-            block.text.draw(
-                with: rect.insetBy(dx: horizontalPadding, dy: verticalPadding),
-                options: [.usesLineFragmentOrigin, .usesFontLeading],
-                attributes: attributes
-            )
-        }
+        )
     }
 
     private static func drawTiledWatermark(
@@ -449,13 +724,39 @@ public enum AnnotationRenderer {
 
     private static func drawArrowHead(from start: NSPoint, to end: NSPoint, lineWidth: CGFloat) {
         let angle = atan2(end.y - start.y, end.x - start.x)
-        let length = max(12, lineWidth * 4)
-        let left = NSPoint(x: end.x - length * cos(angle - .pi / 6), y: end.y - length * sin(angle - .pi / 6))
-        let right = NSPoint(x: end.x - length * cos(angle + .pi / 6), y: end.y - length * sin(angle + .pi / 6))
+        let length = max(14, lineWidth * 4.5)
+        let halfWidth = max(6, lineWidth * 2)
+        let base = NSPoint(
+            x: end.x - length * cos(angle),
+            y: end.y - length * sin(angle)
+        )
+        let left = NSPoint(
+            x: base.x - halfWidth * sin(angle),
+            y: base.y + halfWidth * cos(angle)
+        )
+        let right = NSPoint(
+            x: base.x + halfWidth * sin(angle),
+            y: base.y - halfWidth * cos(angle)
+        )
         let path = NSBezierPath()
-        path.lineWidth = max(1, lineWidth)
-        path.lineCapStyle = .round
-        path.move(to: left); path.line(to: end); path.line(to: right); path.stroke()
+        path.move(to: end)
+        path.line(to: left)
+        path.line(to: right)
+        path.close()
+        path.fill()
+    }
+
+    private static func arrowShaftEnd(from start: NSPoint, to end: NSPoint, lineWidth: CGFloat) -> NSPoint {
+        let deltaX = end.x - start.x
+        let deltaY = end.y - start.y
+        let distance = hypot(deltaX, deltaY)
+        guard distance > 0 else { return end }
+        let headLength = max(14, lineWidth * 4.5)
+        let inset = min(headLength * 0.72, distance * 0.9)
+        return NSPoint(
+            x: end.x - inset * deltaX / distance,
+            y: end.y - inset * deltaY / distance
+        )
     }
 
     public static func pixelatedImage(baseImage: CGImage, blockSize: CGFloat) -> CGImage? {
@@ -535,12 +836,12 @@ public enum AnnotationRenderer {
             }
         } else {
             let bounds = annotation.normalizedRect
-            let destination = CGRect(
+            let destination = expandingPixelRect(
                 x: bounds.minX * CGFloat(baseImage.width),
                 y: bounds.minY * canvasHeight,
                 width: bounds.width * CGFloat(baseImage.width),
                 height: bounds.height * canvasHeight
-            ).integral
+            )
             guard destination.width >= 2, destination.height >= 2 else {
                 context.restoreGState()
                 return
@@ -550,6 +851,22 @@ public enum AnnotationRenderer {
         context.interpolationQuality = .none
         context.draw(pixelated, in: CGRect(x: 0, y: 0, width: baseImage.width, height: baseImage.height))
         context.restoreGState()
+    }
+
+    /// Maps a top-left-origin pixel rect to integer pixel coordinates, expanding
+    /// outward (floor origin, ceil size) so the exported region covers the same
+    /// area as the on-screen preview instead of drifting by a rounding error.
+    private static func expandingPixelRect(x: CGFloat, y: CGFloat, width: CGFloat, height: CGFloat) -> CGRect {
+        let minX = floor(x)
+        let minY = floor(y)
+        let maxX = ceil(x + width)
+        let maxY = ceil(y + height)
+        return CGRect(
+            x: minX,
+            y: minY,
+            width: maxX - minX,
+            height: maxY - minY
+        )
     }
 
     private static func point(_ normalized: CGPoint, size: NSSize) -> NSPoint {

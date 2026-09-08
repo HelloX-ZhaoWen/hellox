@@ -5,8 +5,15 @@ import UniformTypeIdentifiers
 @MainActor
 final class WatermarkImportWindowController: NSWindowController, NSWindowDelegate {
     init(model: AppModel) {
-        let minimumSize = NSSize(width: 480, height: 360)
+        let minimumSize = NSSize(width: 520, height: 292)
+        let window = HelloXWindow(
+            contentRect: NSRect(origin: .zero, size: minimumSize),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
         let rootView = WatermarkImportView(
+            onClose: { [weak window] in window?.performClose(nil) },
             onChoose: { [weak model] in
                 model?.chooseImageForWatermark()
             },
@@ -14,20 +21,18 @@ final class WatermarkImportWindowController: NSWindowController, NSWindowDelegat
                 model?.openWatermarkEditor(for: url) ?? false
             }
         )
-        let window = HelloXWindow(
-            contentRect: NSRect(origin: .zero, size: minimumSize),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
-            backing: .buffered,
-            defer: false
-        )
         window.title = "图片加水印"
         window.isReleasedWhenClosed = false
         window.collectionBehavior = [.moveToActiveSpace]
         window.tabbingMode = .disallowed
         window.minSize = minimumSize
         window.center()
-        window.contentViewController = NSHostingController(rootView: rootView)
-        HelloXWindowStyle.apply(to: window, movableByBackground: false)
+        window.contentViewController = HXDialogHostingController(
+            rootView: HXDialogWindowContent(title: "图片加水印", subtitle: "上传图片后，将自动进入水印编辑器", onClose: { [weak window] in window?.performClose(nil) }) {
+                rootView
+            }, minimumSize: minimumSize
+        )
+        HelloXWindowStyle.applyDialog(to: window)
         window.setContentSize(minimumSize)
         super.init(window: window)
         window.delegate = self
@@ -52,6 +57,7 @@ final class WatermarkImportWindowController: NSWindowController, NSWindowDelegat
 }
 
 struct WatermarkImportView: View {
+    var onClose: () -> Void = {}
     let onChoose: () -> Void
     let onDrop: (URL) -> Bool
 
@@ -60,42 +66,28 @@ struct WatermarkImportView: View {
     @State private var dropError: String?
 
     var body: some View {
-        ZStack {
-            HelloXGlowBackground()
+        ZStack(alignment: .topLeading) {
+            HXDialogStyle.background(colorScheme)
                 .ignoresSafeArea()
 
-            VStack(spacing: 18) {
-                VStack(spacing: 8) {
-                    HelloXIcon(icon: .watermark, size: 28)
-                        .foregroundStyle(.white)
-                        .frame(width: 50, height: 50)
-                        .background(HelloXTheme.accentGradient, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-                    Text("图片加水印")
-                        .font(.system(size: 22, weight: .bold))
-                        .foregroundStyle(HelloXTheme.primaryText(for: colorScheme))
-                    Text("上传图片后，将自动进入水印编辑器")
-                        .font(.system(size: 12))
-                        .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
-                }
-
+            VStack(spacing: HXSpacing.md) {
                 Button {
                     dropError = nil
                     onChoose()
                 } label: {
                     VStack(spacing: 12) {
-                        HelloXIcon(icon: .save, size: 27)
-                            .foregroundStyle(HelloXTheme.accent)
+                        HelloXIcon(icon: .upload, size: 24)
+                            .foregroundStyle(HelloXTheme.iconForeground(for: colorScheme))
                         VStack(spacing: 4) {
                             Text(isDropTargeted ? "松开即可上传" : "点击或拖拽上传图片")
-                                .font(.system(size: 15, weight: .semibold))
+                                .font(HXTypography.section)
                                 .foregroundStyle(HelloXTheme.primaryText(for: colorScheme))
                             Text("支持 PNG、JPG、HEIC、TIFF 等常见图片格式")
-                                .font(.system(size: 11))
+                                .font(HXTypography.caption)
                                 .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
                         }
-                        HelloXUtilityButtonLabel(title: "选择图片", role: .accent)
                     }
-                    .frame(maxWidth: .infinity, minHeight: 150)
+                    .frame(maxWidth: .infinity, minHeight: 128, maxHeight: .infinity)
                     .background(
                         (isDropTargeted
                             ? HelloXTheme.selectedBackground(for: colorScheme)
@@ -106,12 +98,13 @@ struct WatermarkImportView: View {
                         RoundedRectangle(cornerRadius: HelloXTheme.cardRadius, style: .continuous)
                             .stroke(
                                 isDropTargeted ? HelloXTheme.accent : HelloXTheme.border(for: colorScheme),
-                                style: StrokeStyle(lineWidth: isDropTargeted ? 2 : 1.5, dash: [7, 5])
+                                lineWidth: isDropTargeted ? 2 : 1
                             )
                     }
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .keyboardShortcut(.defaultAction)
                 .accessibilityLabel("点击或拖拽上传图片")
                 .dropDestination(for: URL.self) { urls, _ in
                     guard let url = urls.first else { return false }
@@ -127,13 +120,16 @@ struct WatermarkImportView: View {
                     HelloXStatusBanner(message: dropError, kind: .error)
                 } else {
                     Text("图片仅在本机处理，不会上传到服务器")
-                        .font(.system(size: 11, weight: .medium))
+                        .font(HXTypography.caption)
                         .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
-            .padding(.horizontal, 24)
-            .padding(.vertical, 20)
+            .padding(.horizontal, 20)
+            .padding(.bottom, 20)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
-        .frame(minWidth: 480, minHeight: 360)
+        .font(HXTypography.body)
+        .onExitCommand(perform: onClose)
     }
 }

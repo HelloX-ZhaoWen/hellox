@@ -1,3 +1,13 @@
+Third-party notice scope
+
+The Lucide notice below applies to the Lucide-derived SVGs identified in
+README.md as "Codex bundled Lucide". Their path geometry is unchanged; the
+stroke width is adapted for optical consistency with the Codex light icon set.
+
+Codex native SVGs and settings-component SVGs are separately identified by
+source in README.md. They are not represented as Lucide-licensed assets.
+HelloX brand assets and vendor brand assets are outside this directory.
+
 Lucide Icons
 Copyright (c) 2020 Lucide Contributors
 Licensed under the ISC License: https://github.com/lucide-icons/lucide/blob/main/LICENSE

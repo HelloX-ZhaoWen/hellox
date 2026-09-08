@@ -1,4 +1,5 @@
 import AppKit
+import HelloXCore
 import SwiftUI
 
 @MainActor
@@ -6,23 +7,23 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     let editorDocument: EditorDocument
     var onClose: (() -> Void)?
 
-    init(document: EditorDocument, startsWithWatermark: Bool = false) {
+    init(document: EditorDocument, startsWithWatermark: Bool = false, initialTool: AnnotationTool = .select) {
         self.editorDocument = document
-        let rootView = EditorView(
-            document: document,
-            startsWithWatermark: startsWithWatermark
-        )
         let window = HelloXWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1080, height: 720),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
-        window.title = "HelloX 编辑器"
+        window.title = "截图编辑器"
         window.minSize = NSSize(width: 760, height: 520)
         window.center()
-        window.contentViewController = NSHostingController(rootView: rootView)
-        HelloXWindowStyle.apply(to: window, movableByBackground: false)
+        window.contentViewController = HXDialogHostingController(
+            rootView: EditorView(document: document, startsWithWatermark: startsWithWatermark,
+                                 initialTool: initialTool, onClose: { [weak window] in window?.performClose(nil) }),
+            minimumSize: NSSize(width: 760, height: 520)
+        )
+        HelloXWindowStyle.applyDialog(to: window)
         window.setContentSize(NSSize(width: 1080, height: 720))
         super.init(window: window)
         window.delegate = self
@@ -33,7 +34,7 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         guard editorDocument.dirty else { return true }
-        let alert = NSAlert()
+        let alert = HelloXAlert()
         alert.messageText = "关闭前保存截图？"
         alert.informativeText = "未保存的标注将会丢失。"
         alert.addButton(withTitle: "保存并关闭")

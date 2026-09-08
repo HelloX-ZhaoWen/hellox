@@ -34,7 +34,9 @@ final class CopyFeedbackPresenter {
         let panel = self.panel ?? makePanel(frame: frame)
         self.panel = panel
         panel.setFrame(frame, display: true)
-        panel.contentView = NSHostingView(rootView: CopyFeedbackToast(message: message, isSuccess: isSuccess))
+        panel.contentView = NSHostingView(
+            rootView: CopyFeedbackToast(message: message, isSuccess: isSuccess)
+        )
         panel.orderFrontRegardless()
 
         dismissTask = Task { @MainActor [weak self, weak panel] in
@@ -73,13 +75,14 @@ private struct CopyFeedbackToast: View {
             Text(message)
                 .font(.system(size: 12, weight: .semibold))
         }
-        .foregroundStyle(.white)
+        .foregroundStyle(isSuccess ? HelloXTheme.success : HelloXTheme.error)
         .padding(.horizontal, 16)
         .frame(width: 220, height: 42)
         .background(
-            (isSuccess ? HelloXTheme.success : HelloXTheme.error).opacity(0.94),
-            in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+            Color.black.opacity(0.94),
+            in: Capsule()
         )
+        .overlay(Capsule().stroke(Color.white.opacity(0.10), lineWidth: 1))
         .shadow(color: .black.opacity(0.22), radius: 14, y: 6)
         .padding(.vertical, 3)
     }

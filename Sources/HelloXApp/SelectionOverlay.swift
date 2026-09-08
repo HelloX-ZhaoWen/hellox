@@ -2,6 +2,7 @@
 import AppKit
 import HelloXCore
 import QuartzCore
+import SwiftUI
 
 enum CaptureOverlayAppearance {
     static let selectionDimOpacity: CGFloat = 0.44
@@ -241,13 +242,6 @@ final class CaptureOverlayCanvasView: NSView {
         displayIfNeeded()
     }
 
-    var containsSingleOverlayTree: Bool {
-        selectionContentView.superview === self && editorContentView?.superview === self
-    }
-
-    var isEditorActive: Bool {
-        selectionContentView.isHidden && editorContentView?.alphaValue == 1
-    }
 }
 
 /// Uses one overlay per display so selection remains reliable across Spaces and
@@ -697,19 +691,6 @@ final class SelectionOverlayController: NSObject {
         )
     }
 
-    /// Keeps the existing masks on secondary displays during the editor handoff. Reusing these
-    /// panels avoids briefly stacking two translucent black surfaces on non-target displays.
-    func showDimMasks(excluding targetScreen: NSScreen) {
-        for window in windows {
-            window.ignoresMouseEvents = true
-            if window.frame == targetScreen.frame {
-                window.orderOut(nil)
-            } else {
-                window.orderFrontRegardless()
-            }
-        }
-    }
-
     private static func discoverWindowHitCandidates(inside allowedRect: CGRect?) -> [WindowHitCandidate] {
         guard let items = CGWindowListCopyWindowInfo(
             [.optionOnScreenOnly, .excludeDesktopElements],
@@ -1123,13 +1104,20 @@ private final class SelectionView: NSView {
             NSGraphicsContext.current?.restoreGraphicsState()
         }
 
-        NSColor(calibratedRed: 37 / 255, green: 99 / 255, blue: 235 / 255, alpha: 1).setStroke()
         let path = NSBezierPath(rect: localRect.insetBy(dx: 1, dy: 1))
+        NSColor.white.withAlphaComponent(0.88).setStroke()
+        path.lineWidth = 4
+        path.stroke()
+        NSColor(HelloXTheme.accent).setStroke()
         path.lineWidth = 2
         path.stroke()
 
         if showsSize, let end = selectionEnd, screenFrame.contains(end) {
-            drawLabel("\(Int(globalRect.width)) × \(Int(globalRect.height))", at: CGPoint(x: end.x - screenFrame.minX, y: end.y - screenFrame.minY))
+            drawLabel(
+                "\(Int(globalRect.width)) × \(Int(globalRect.height))",
+                at: CGPoint(x: end.x - screenFrame.minX, y: end.y - screenFrame.minY),
+                showsBackground: false
+            )
         } else if screenFrame.contains(CGPoint(x: globalRect.midX, y: globalRect.midY)) {
             drawLabel("\(highlightLabel)  单击选择 · 拖动自定义", at: CGPoint(x: localRect.minX + 8, y: localRect.maxY - 8))
         }
@@ -1151,25 +1139,39 @@ private final class SelectionView: NSView {
         }
     }
 
-    private func drawLabel(_ label: String, at point: CGPoint) {
-        let attributes: [NSAttributedString.Key: Any] = [
+    private func drawLabel(_ label: String, at point: CGPoint, showsBackground: Bool = true) {
+        var attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
             .foregroundColor: NSColor.white
         ]
+        if !showsBackground {
+            let shadow = NSShadow()
+            shadow.shadowColor = NSColor.black.withAlphaComponent(0.90)
+            shadow.shadowOffset = NSSize(width: 0, height: -1)
+            shadow.shadowBlurRadius = 2
+            attributes[.shadow] = shadow
+        }
         let text = NSString(string: label)
         let size = text.size(withAttributes: attributes)
-        let backgroundSize = CGSize(width: size.width + 18, height: size.height + 10)
+        let horizontalInset: CGFloat = showsBackground ? 9 : 3
+        let verticalInset: CGFloat = showsBackground ? 5 : 2
+        let backgroundSize = CGSize(
+            width: size.width + horizontalInset * 2,
+            height: size.height + verticalInset * 2
+        )
         let origin = CGPoint(
             x: min(max(6, point.x + 8), bounds.maxX - backgroundSize.width - 6),
             y: min(max(6, point.y - backgroundSize.height - 8), bounds.maxY - backgroundSize.height - 6)
         )
-        let backgroundRect = CGRect(origin: origin, size: backgroundSize)
-        NSColor(calibratedRed: 37 / 255, green: 99 / 255, blue: 235 / 255, alpha: 0.96).setFill()
-        NSBezierPath(roundedRect: backgroundRect, xRadius: 8, yRadius: 8).fill()
-        NSColor.white.withAlphaComponent(0.24).setStroke()
-        NSBezierPath(roundedRect: backgroundRect.insetBy(dx: 0.5, dy: 0.5), xRadius: 8, yRadius: 8).stroke()
+        if showsBackground {
+            let backgroundRect = CGRect(origin: origin, size: backgroundSize)
+            NSColor(HelloXTheme.accent).withAlphaComponent(0.96).setFill()
+            NSBezierPath(roundedRect: backgroundRect, xRadius: 8, yRadius: 8).fill()
+            NSColor.white.withAlphaComponent(0.32).setStroke()
+            NSBezierPath(roundedRect: backgroundRect.insetBy(dx: 0.5, dy: 0.5), xRadius: 8, yRadius: 8).stroke()
+        }
         text.draw(
-            at: CGPoint(x: origin.x + 9, y: origin.y + 5),
+            at: CGPoint(x: origin.x + horizontalInset, y: origin.y + verticalInset),
             withAttributes: attributes
         )
     }

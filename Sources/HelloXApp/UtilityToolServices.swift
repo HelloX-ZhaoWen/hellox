@@ -6,6 +6,7 @@ enum UtilityTool: String, CaseIterable, Hashable {
     case csvToExcel
     case base64
     case qrCode
+    case colorPicker
     case password
     case markdown
 
@@ -14,10 +15,23 @@ enum UtilityTool: String, CaseIterable, Hashable {
         case .csvToExcel: "CSV 转 Excel"
         case .base64: "Base64 转换"
         case .qrCode: "二维码识别"
+        case .colorPicker: "取色器"
         case .password: "随机密码"
         case .markdown: "Markdown 转换"
         }
     }
+
+    var dialogSubtitle: String? {
+        switch self {
+        case .csvToExcel: "将 CSV 表格转换为可在 Excel 中打开的 .xlsx 文件"
+        case .base64: "在普通文本与 Base64 文本之间转换"
+        case .qrCode: "从图片中识别二维码内容"
+        case .password: "使用系统安全随机源生成高强度密码"
+        case .markdown: "阅读、编辑并导出 Markdown 文档"
+        case .colorPicker: nil
+        }
+    }
+
 }
 
 enum UtilityToolError: LocalizedError, Equatable {
@@ -241,6 +255,78 @@ enum Base64Converter {
     }
 }
 
+struct ColorCode: Equatable, Sendable {
+    let red: Int
+    let green: Int
+    let blue: Int
+    let alpha: Int
+
+    init(red: Int, green: Int, blue: Int, alpha: Int = 255) {
+        self.red = min(max(red, 0), 255)
+        self.green = min(max(green, 0), 255)
+        self.blue = min(max(blue, 0), 255)
+        self.alpha = min(max(alpha, 0), 255)
+    }
+
+    init(color: NSColor) {
+        let converted = color.usingColorSpace(.sRGB) ?? color
+        var red: CGFloat = 0
+        var green: CGFloat = 0
+        var blue: CGFloat = 0
+        var alpha: CGFloat = 0
+        converted.getRed(&red, green: &green, blue: &blue, alpha: &alpha)
+        self.init(
+            red: Int((red * 255).rounded()),
+            green: Int((green * 255).rounded()),
+            blue: Int((blue * 255).rounded()),
+            alpha: Int((alpha * 255).rounded())
+        )
+    }
+
+    var hex: String {
+        let rgb = String(format: "#%02X%02X%02X", red, green, blue)
+        return alpha == 255 ? rgb : rgb + String(format: "%02X", alpha)
+    }
+
+    var rgb: String {
+        guard alpha < 255 else { return "rgb(\(red), \(green), \(blue))" }
+        return "rgba(\(red), \(green), \(blue), \(formattedAlpha))"
+    }
+
+    var hsl: String {
+        let normalizedRed = Double(red) / 255
+        let normalizedGreen = Double(green) / 255
+        let normalizedBlue = Double(blue) / 255
+        let maximum = max(normalizedRed, normalizedGreen, normalizedBlue)
+        let minimum = min(normalizedRed, normalizedGreen, normalizedBlue)
+        let delta = maximum - minimum
+        let lightness = (maximum + minimum) / 2
+        let saturation = delta == 0 ? 0 : delta / (1 - abs(2 * lightness - 1))
+
+        let rawHue: Double
+        if delta == 0 {
+            rawHue = 0
+        } else if maximum == normalizedRed {
+            rawHue = 60 * ((normalizedGreen - normalizedBlue) / delta).truncatingRemainder(dividingBy: 6)
+        } else if maximum == normalizedGreen {
+            rawHue = 60 * (((normalizedBlue - normalizedRed) / delta) + 2)
+        } else {
+            rawHue = 60 * (((normalizedRed - normalizedGreen) / delta) + 4)
+        }
+        let hue = Int((rawHue < 0 ? rawHue + 360 : rawHue).rounded()) % 360
+        let hsl = "\(hue), \(Int((saturation * 100).rounded()))%, \(Int((lightness * 100).rounded()))%"
+        return alpha == 255 ? "hsl(\(hsl))" : "hsla(\(hsl), \(formattedAlpha))"
+    }
+
+    private var formattedAlpha: String {
+        let value = Double(alpha) / 255
+        if value == 0 || value == 1 { return String(Int(value)) }
+        return String(format: "%.2f", value)
+            .replacingOccurrences(of: "0+$", with: "", options: .regularExpression)
+            .replacingOccurrences(of: "\\.$", with: "", options: .regularExpression)
+    }
+}
+
 enum SecurePasswordGenerator {
     static func generate(
         length: Int,
@@ -313,17 +399,55 @@ enum MarkdownFileService {
     }
 }
 
+private func markdownLines(in markdown: String) -> [String] {
+    markdown
+        .replacingOccurrences(of: "\r\n", with: "\n")
+        .replacingOccurrences(of: "\r", with: "\n")
+        .components(separatedBy: .newlines)
+}
+
 struct MarkdownHeading: Identifiable, Equatable, Sendable {
     let id: String
     let level: Int
     let title: String
 }
 
+struct MarkdownOutlineRow: Identifiable, Equatable, Sendable {
+    let heading: MarkdownHeading
+    let depth: Int
+    let hasChildren: Bool
+    var id: String { heading.id }
+}
+
+enum MarkdownOutline {
+    static func visibleRows(
+        headings: [MarkdownHeading],
+        collapsedIDs: Set<String>
+    ) -> [MarkdownOutlineRow] {
+        var ancestors: [MarkdownHeading] = []
+        var rows: [MarkdownOutlineRow] = []
+        for (index, heading) in headings.enumerated() {
+            while let parent = ancestors.last, parent.level >= heading.level {
+                ancestors.removeLast()
+            }
+            if !ancestors.contains(where: { collapsedIDs.contains($0.id) }) {
+                rows.append(MarkdownOutlineRow(
+                    heading: heading,
+                    depth: ancestors.count,
+                    hasChildren: index + 1 < headings.count && headings[index + 1].level > heading.level
+                ))
+            }
+            ancestors.append(heading)
+        }
+        return rows
+    }
+}
+
 enum MarkdownHeadingParser {
     static func headings(in markdown: String) -> [MarkdownHeading] {
         var result: [MarkdownHeading] = []
         var isInsideCodeFence = false
-        for rawLine in markdown.components(separatedBy: .newlines) {
+        for rawLine in markdownLines(in: markdown) {
             let line = rawLine.trimmingCharacters(in: .whitespaces)
             if line.hasPrefix("```") || line.hasPrefix("~~~") {
                 isInsideCodeFence.toggle()
@@ -360,16 +484,63 @@ enum MarkdownHeadingParser {
     }
 }
 
+enum MarkdownLocalImageScheme {
+    static let name = "hellox-markdown-image"
+
+    static func previewBaseURL(for directoryURL: URL?) -> URL? {
+        guard let directoryURL else { return nil }
+        guard directoryURL.isFileURL else { return directoryURL }
+        let localDirectoryURL = URL(
+            fileURLWithPath: directoryURL.standardizedFileURL.path,
+            isDirectory: true
+        )
+        var components = URLComponents(url: localDirectoryURL, resolvingAgainstBaseURL: false)
+        components?.scheme = name
+        return components?.url
+    }
+
+    static func fileURL(for previewURL: URL) -> URL? {
+        guard previewURL.scheme?.lowercased() == name,
+              previewURL.host == nil || previewURL.host?.isEmpty == true,
+              previewURL.user == nil,
+              previewURL.password == nil,
+              previewURL.port == nil else { return nil }
+        return URL(fileURLWithPath: previewURL.path).standardizedFileURL
+    }
+
+    static func resolvedFileURL(_ fileURL: URL, containedIn directoryURL: URL) -> URL? {
+        guard fileURL.isFileURL, directoryURL.isFileURL else { return nil }
+        let resolvedDirectoryURL = directoryURL.resolvingSymlinksInPath().standardizedFileURL
+        let resolvedFileURL = fileURL.resolvingSymlinksInPath().standardizedFileURL
+        let directoryPath = resolvedDirectoryURL.path.hasSuffix("/")
+            ? resolvedDirectoryURL.path
+            : resolvedDirectoryURL.path + "/"
+        guard resolvedFileURL.path == resolvedDirectoryURL.path
+                || resolvedFileURL.path.hasPrefix(directoryPath) else { return nil }
+        return resolvedFileURL
+    }
+}
+
 enum MarkdownHTMLConverter {
-    static func convert(_ markdown: String, title: String = "Markdown", baseURL: URL? = nil) -> String {
-        let body = bodyHTML(markdown)
+    private static let maximumBlockquoteDepth = 32
+
+    static func convert(
+        _ markdown: String,
+        title: String = "Markdown",
+        baseURL: URL? = nil,
+        localFileImageScheme: String? = nil
+    ) -> String {
+        let body = rewritingFileImageSources(
+            in: bodyHTML(markdown),
+            to: localFileImageScheme
+        )
         let baseTag = baseURL.map { "<base href=\"\(htmlEscaped($0.absoluteString))\">" } ?? ""
         return """
         <!doctype html>
         <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">\(baseTag)<title>\(htmlEscaped(title))</title>
         <style>
-        :root{color-scheme:light dark;--bg:#fff;--text:#1f2937;--muted:#64748b;--line:#e2e8f0;--soft:#f1f5f9;--accent:#2563eb;--scroll-thumb:rgba(15,23,42,.16);--scroll-hover:rgba(15,23,42,.42)}
-        @media(prefers-color-scheme:dark){:root{--bg:#101827;--text:#e5edf8;--muted:#9fb0c8;--line:#334155;--soft:#1e293b;--accent:#60a5fa;--scroll-thumb:rgba(248,250,252,.16);--scroll-hover:rgba(248,250,252,.42)}}
+        :root{color-scheme:light dark;--bg:#fff;--text:#0f1419;--muted:#536471;--line:#eff3f4;--soft:#f7f9f9;--accent:#009aff;--scroll-thumb:rgba(15,20,25,.16);--scroll-hover:rgba(15,20,25,.42)}
+        @media(prefers-color-scheme:dark){:root{--bg:#000;--text:#e7e9ea;--muted:#8b98a5;--line:#2f3336;--soft:#16181c;--accent:#009aff;--scroll-thumb:rgba(231,233,234,.16);--scroll-hover:rgba(231,233,234,.42)}}
         *{box-sizing:border-box}html{scroll-behavior:smooth;background:var(--bg)}body{font:16px -apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC",sans-serif;line-height:1.75;max-width:980px;margin:0 auto;padding:52px 64px 96px;color:var(--text);background:var(--bg)}
         ::-webkit-scrollbar{width:12px;height:12px;background:transparent}::-webkit-scrollbar-track,::-webkit-scrollbar-corner{background:transparent;border:0}::-webkit-scrollbar-thumb{background:var(--scroll-thumb);background-clip:padding-box;border:4px solid transparent;border-radius:999px}::-webkit-scrollbar-thumb:hover{background:var(--scroll-hover);background-clip:padding-box}
         h1,h2,h3,h4,h5,h6{font-weight:750;line-height:1.28;letter-spacing:-.015em;margin:1.7em 0 .65em;scroll-margin-top:28px}h1{font-size:2.45em;border-bottom:1px solid var(--line);padding-bottom:.32em;margin-top:.35em}h2{font-size:1.75em;border-bottom:1px solid var(--line);padding-bottom:.28em}h3{font-size:1.35em}h4{font-size:1.12em}p{margin:.85em 0}ul,ol{padding-left:1.65em;margin:.8em 0}li{margin:.32em 0}
@@ -380,11 +551,12 @@ enum MarkdownHTMLConverter {
         """
     }
 
-    private static func bodyHTML(_ markdown: String) -> String {
+    private static func bodyHTML(_ markdown: String, blockquoteDepth: Int = 0) -> String {
         var output: [String] = []
         var paragraph: [String] = []
         var isInsideCodeFence = false
         var currentList: String?
+        var rawHTMLContainer: RawHTMLContainer?
         var headingIndex = 0
 
         func flushParagraph() {
@@ -398,7 +570,7 @@ enum MarkdownHTMLConverter {
             currentList = nil
         }
 
-        let lines = markdown.components(separatedBy: .newlines)
+        let lines = markdownLines(in: markdown)
         var lineIndex = 0
         while lineIndex < lines.count {
             let rawLine = lines[lineIndex]
@@ -416,10 +588,58 @@ enum MarkdownHTMLConverter {
                 lineIndex += 1
                 continue
             }
+
+            if let container = rawHTMLContainer {
+                if rawHTMLClosingTag(in: line) == container.tag {
+                    output.append("</\(container.tag)>")
+                    rawHTMLContainer = nil
+                } else if let imageHTML = sanitizedRawImageHTML(line) {
+                    output.append(imageHTML)
+                } else if !line.isEmpty {
+                    output.append(inlineHTML(line))
+                }
+                lineIndex += 1
+                continue
+            }
+
+            if let blockHTML = sanitizedRawHTMLBlock(line) {
+                flushParagraph()
+                closeList()
+                output.append(blockHTML)
+                lineIndex += 1
+                continue
+            }
+            if let container = rawHTMLContainerOpening(in: line) {
+                flushParagraph()
+                closeList()
+                output.append(container.openingHTML)
+                rawHTMLContainer = container
+                lineIndex += 1
+                continue
+            }
+            if let imageHTML = sanitizedRawImageHTML(line) {
+                flushParagraph()
+                closeList()
+                output.append(imageHTML)
+                lineIndex += 1
+                continue
+            }
             if line.isEmpty {
                 flushParagraph()
                 closeList()
                 lineIndex += 1
+                continue
+            }
+
+            if let blockquote = blockquoteBlock(
+                in: lines,
+                startingAt: lineIndex,
+                depth: blockquoteDepth
+            ) {
+                flushParagraph()
+                closeList()
+                output.append(blockquote.html)
+                lineIndex = blockquote.nextIndex
                 continue
             }
 
@@ -460,9 +680,6 @@ enum MarkdownHTMLConverter {
             if line == "---" || line == "***" || line == "___" {
                 flushParagraph()
                 output.append("<hr>")
-            } else if line.hasPrefix("> ") {
-                flushParagraph()
-                output.append("<blockquote><p>\(inlineHTML(String(line.dropFirst(2))))</p></blockquote>")
             } else {
                 paragraph.append(line)
             }
@@ -470,8 +687,179 @@ enum MarkdownHTMLConverter {
         }
         flushParagraph()
         closeList()
+        if let rawHTMLContainer { output.append("</\(rawHTMLContainer.tag)>") }
         if isInsideCodeFence { output.append("</code></pre>") }
         return output.joined(separator: "\n")
+    }
+
+    private struct BlockquoteBlock {
+        let html: String
+        let nextIndex: Int
+    }
+
+    private static func blockquoteBlock(
+        in lines: [String],
+        startingAt index: Int,
+        depth: Int
+    ) -> BlockquoteBlock? {
+        guard depth < maximumBlockquoteDepth else { return nil }
+        var quotedLines: [String] = []
+        var nextIndex = index
+        while nextIndex < lines.count,
+              let content = blockquoteContent(from: lines[nextIndex]) {
+            quotedLines.append(content)
+            nextIndex += 1
+        }
+        guard !quotedLines.isEmpty else { return nil }
+        let contentHTML = bodyHTML(
+            quotedLines.joined(separator: "\n"),
+            blockquoteDepth: depth + 1
+        )
+        return BlockquoteBlock(
+            html: "<blockquote>\n\(contentHTML)\n</blockquote>",
+            nextIndex: nextIndex
+        )
+    }
+
+    private static func blockquoteContent(from rawLine: String) -> String? {
+        let line = rawLine.drop { $0 == " " || $0 == "\t" }
+        guard line.first == ">" else { return nil }
+        var content = line.dropFirst()
+        if content.first == " " || content.first == "\t" {
+            content = content.dropFirst()
+        }
+        return String(content)
+    }
+
+    private struct RawHTMLContainer {
+        let tag: String
+        let openingHTML: String
+    }
+
+    private static func rawHTMLContainerOpening(in line: String) -> RawHTMLContainer? {
+        guard let captures = captures(
+            #"^<(p|div|h[1-6])(?:\s+align\s*=\s*[\"']?(left|center|right)[\"']?)?\s*>$"#,
+            in: line,
+            options: [.caseInsensitive]
+        ), let rawTag = captures[0] else { return nil }
+        let tag = rawTag.lowercased()
+        let alignment = captures[1]?.lowercased()
+        let style = alignment.map { " style=\"text-align:\($0)\"" } ?? ""
+        return RawHTMLContainer(tag: tag, openingHTML: "<\(tag)\(style)>")
+    }
+
+    private static func rawHTMLClosingTag(in line: String) -> String? {
+        guard let captures = captures(
+            #"^</(p|div|h[1-6])\s*>$"#,
+            in: line,
+            options: [.caseInsensitive]
+        ), let tag = captures[0] else { return nil }
+        return tag.lowercased()
+    }
+
+    private static func sanitizedRawHTMLBlock(_ line: String) -> String? {
+        if line.range(of: #"^<br\s*/?>$"#, options: [.regularExpression, .caseInsensitive]) != nil {
+            return "<br>"
+        }
+        guard let captures = captures(
+            #"^<(p|div|h[1-6])(?:\s+align\s*=\s*[\"']?(left|center|right)[\"']?)?\s*>(.*?)</(p|div|h[1-6])\s*>$"#,
+            in: line,
+            options: [.caseInsensitive]
+        ), let rawOpeningTag = captures[0], let content = captures[2], let rawClosingTag = captures[3] else {
+            return nil
+        }
+        let tag = rawOpeningTag.lowercased()
+        guard tag == rawClosingTag.lowercased() else { return nil }
+        let alignment = captures[1]?.lowercased()
+        let style = alignment.map { " style=\"text-align:\($0)\"" } ?? ""
+        return "<\(tag)\(style)>\(inlineHTML(content))</\(tag)>"
+    }
+
+    private static func sanitizedRawImageHTML(_ line: String) -> String? {
+        guard let captures = captures(
+            #"^<img\b([^>]*)/?>$"#,
+            in: line,
+            options: [.caseInsensitive]
+        ), let rawAttributes = captures[0],
+              let expression = try? NSRegularExpression(
+                pattern: #"([A-Za-z][A-Za-z0-9:-]*)\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s\"'=<>`]+))"#
+              ) else { return nil }
+
+        let range = NSRange(rawAttributes.startIndex..., in: rawAttributes)
+        var attributes: [String: String] = [:]
+        expression.enumerateMatches(in: rawAttributes, range: range) { match, _, _ in
+            guard let match,
+                  let nameRange = Range(match.range(at: 1), in: rawAttributes) else { return }
+            let name = rawAttributes[nameRange].lowercased()
+            guard ["src", "alt", "title", "width", "height"].contains(name) else { return }
+            let value = (2...4).compactMap { captureIndex -> String? in
+                guard let valueRange = Range(match.range(at: captureIndex), in: rawAttributes) else { return nil }
+                return String(rawAttributes[valueRange])
+            }.first ?? ""
+            if name == "width" || name == "height" {
+                guard value.range(of: #"^\d{1,5}(?:\.\d+)?%?$"#, options: .regularExpression) != nil else { return }
+            }
+            attributes[name] = value
+        }
+
+        guard let rawSource = attributes["src"] else { return nil }
+        let source = rawSource.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard isSafeImageSource(source) else { return nil }
+        var html = "<img src=\"\(htmlEscaped(source))\" alt=\"\(htmlEscaped(attributes["alt"] ?? ""))\""
+        for name in ["title", "width", "height"] {
+            if let value = attributes[name] {
+                html += " \(name)=\"\(htmlEscaped(value))\""
+            }
+        }
+        return html + ">"
+    }
+
+    private static func isSafeImageSource(_ source: String) -> Bool {
+        let value = source.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return false }
+        guard let colon = value.firstIndex(of: ":") else { return true }
+        let scheme = value[..<colon]
+        guard scheme.range(of: #"^[A-Za-z][A-Za-z0-9+.-]*$"#, options: .regularExpression) != nil else {
+            return true
+        }
+        switch scheme.lowercased() {
+        case "http", "https", "file":
+            return true
+        case "data":
+            return value.lowercased().hasPrefix("data:image/")
+        default:
+            return false
+        }
+    }
+
+    private static func rewritingFileImageSources(in html: String, to scheme: String?) -> String {
+        guard let scheme,
+              scheme.range(of: #"^[A-Za-z][A-Za-z0-9+.-]*$"#, options: .regularExpression) != nil,
+              let expression = try? NSRegularExpression(
+                pattern: #"(<img\b[^>]*\bsrc=\")file:"#,
+                options: [.caseInsensitive]
+              ) else { return html }
+        return expression.stringByReplacingMatches(
+            in: html,
+            range: NSRange(html.startIndex..., in: html),
+            withTemplate: "$1\(scheme):"
+        )
+    }
+
+    private static func captures(
+        _ pattern: String,
+        in value: String,
+        options: NSRegularExpression.Options = []
+    ) -> [String?]? {
+        guard let expression = try? NSRegularExpression(pattern: pattern, options: options) else { return nil }
+        let fullRange = NSRange(value.startIndex..., in: value)
+        guard let match = expression.firstMatch(in: value, range: fullRange), match.range == fullRange else {
+            return nil
+        }
+        return (1..<match.numberOfRanges).map { index in
+            guard let range = Range(match.range(at: index), in: value) else { return nil }
+            return String(value[range])
+        }
     }
 
     private struct TableBlock {

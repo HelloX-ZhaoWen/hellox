@@ -6,62 +6,64 @@ public struct RecognizedTextParagraph: Equatable, Sendable, Identifiable {
     public let text: String
     public let boundingBox: CGRect
     public let blocks: [RecognizedTextBlock]
-    public let lineCount: Int
-    /// Relative widths of source lines, from top to bottom. These let translated
-    /// text retain the source paragraph's visual rhythm after one full-paragraph
-    /// translation request.
-    public let lineWidthRatios: [CGFloat]
 
     public init(
         id: UUID,
         text: String,
         boundingBox: CGRect,
-        blocks: [RecognizedTextBlock],
-        lineCount: Int,
-        lineWidthRatios: [CGFloat]
+        blocks: [RecognizedTextBlock]
     ) {
         self.id = id
         self.text = text
         self.boundingBox = boundingBox
         self.blocks = blocks
-        self.lineCount = max(1, lineCount)
-        self.lineWidthRatios = lineWidthRatios.isEmpty ? [1] : lineWidthRatios
     }
 }
 
 public enum OCRParagraphLayout {
+    /// Produces OCR display/copy text using recovered natural paragraphs.
+    /// Visual wrapping inside one semantic paragraph is removed, while
+    /// headings, lists, completed sentences, columns, and isolated symbols
+    /// retain explicit line boundaries.
+    public static func semanticJoin(_ blocks: [RecognizedTextBlock]) -> String {
+        let paragraphs = paragraphs(from: blocks)
+        let consumedIDs = Set(paragraphs.flatMap(\.blocks).map(\.id))
+        var units: [(box: CGRect, text: String)] = paragraphs.map {
+            ($0.boundingBox, semanticText($0.text))
+        }
+        units.append(contentsOf: blocks.compactMap { block in
+            guard !consumedIDs.contains(block.id) else { return nil }
+            let text = block.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { return nil }
+            return (block.boundingBox, text)
+        })
+        return units.sorted { lhs, rhs in
+            let tolerance = max(lhs.box.height, rhs.box.height) * 0.55
+            if abs(lhs.box.midY - rhs.box.midY) > tolerance {
+                return lhs.box.midY > rhs.box.midY
+            }
+            return lhs.box.minX < rhs.box.minX
+        }
+        .map(\.text)
+        .filter { !$0.isEmpty }
+        .joined(separator: "\n")
+    }
+
     public static func paragraphs(from blocks: [RecognizedTextBlock]) -> [RecognizedTextParagraph] {
         let ordered = blocks
-            .filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .filter {
+                let text = $0.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                return !text.isEmpty && !isStandaloneSymbol(text)
+            }
             .sorted(by: VisionOCRService.readingOrder)
         guard !ordered.isEmpty else { return [] }
 
-        // Vision's reading order interleaves lines from adjacent columns. Build
-        // spatially connected components instead of walking that order so each
-        // column still becomes a complete paragraph.
-        var parent = Array(ordered.indices)
-        func root(_ index: Int) -> Int {
-            var current = index
-            while parent[current] != current { current = parent[current] }
-            return current
-        }
-        func join(_ lhs: Int, _ rhs: Int) {
-            let lhsRoot = root(lhs)
-            let rhsRoot = root(rhs)
-            if lhsRoot != rhsRoot { parent[rhsRoot] = lhsRoot }
-        }
-        for lhs in ordered.indices {
-            for rhs in ordered.indices where rhs > lhs {
-                if blocksBelongToSameParagraph(ordered[lhs], ordered[rhs]) {
-                    join(lhs, rhs)
-                }
-            }
-        }
-        var groups: [Int: [RecognizedTextBlock]] = [:]
-        for index in ordered.indices {
-            groups[root(index), default: []].append(ordered[index])
-        }
-        return groups.values.map(makeParagraph).sorted { lhs, rhs in
+        // Keep the spatial detector and semantic correction pass independent so
+        // callers can test each decision. The old union-find implementation was
+        // too eager around columns and could merge unrelated UI labels.
+        let spatialGroups = ImageParagraphDetector.detect(from: ordered)
+        let correctedGroups = TextParagraphCorrector.correct(spatialGroups)
+        return correctedGroups.map(makeParagraph).sorted { lhs, rhs in
             let tolerance = max(lhs.boundingBox.height, rhs.boundingBox.height) * 0.12
             if abs(lhs.boundingBox.maxY - rhs.boundingBox.maxY) > tolerance {
                 return lhs.boundingBox.maxY > rhs.boundingBox.maxY
@@ -70,9 +72,7 @@ public enum OCRParagraphLayout {
         }
     }
 
-    /// Restores visual line breaks after translating a complete paragraph. The
-    /// original line widths act as proportional targets, so short first/last
-    /// lines and numbered lists keep their original rhythm.
+    /// Reflows text using caller-provided widths.
     public static func reflow(_ text: String, lineWidthRatios: [CGFloat]) -> String {
         let normalized = text
             .components(separatedBy: .whitespacesAndNewlines)
@@ -86,58 +86,100 @@ public enum OCRParagraphLayout {
         if words.count >= desiredLines {
             return balancedLines(tokens: words, separator: " ", lineWidthRatios: widths)
         }
-        return balancedLines(tokens: normalized.map(String.init), separator: "", lineWidthRatios: widths)
+        // Fewer words than lines. Only character-split when the text has no
+        // word boundaries (e.g. CJK); otherwise keep whole words so a
+        // translation is never broken mid-word.
+        if words.count == 1, words[0] == normalized {
+            return balancedLines(tokens: normalized.map(String.init), separator: "", lineWidthRatios: widths)
+        }
+        return balancedLines(tokens: words, separator: " ", lineWidthRatios: widths)
     }
 
-    /// Distributes one complete paragraph translation back into its original OCR
-    /// boxes. Translation gets full context; the on-image placement stays tied
-    /// to the exact source boxes, preserving columns, controls and background.
-    public static func distribute(
-        _ text: String,
-        across sourceBlocks: [RecognizedTextBlock]
-    ) -> [String] {
-        let ordered = sourceBlocks.sorted(by: VisionOCRService.readingOrder)
-        let explicitLines = text
+    /// Returns true when a block is made entirely from standalone symbols,
+    /// punctuation, emoji-like characters, combining marks, or private-use
+    /// glyphs. Text containing a letter or number is intentionally excluded so
+    /// URLs, amounts, identifiers, and code remain translatable.
+    public static func isStandaloneSymbol(_ text: String) -> Bool {
+        let scalars = text.unicodeScalars.filter {
+            !CharacterSet.whitespacesAndNewlines.contains($0)
+        }
+        guard !scalars.isEmpty else { return false }
+
+        let isEmojiSequence = scalars.contains {
+            $0.properties.isEmojiPresentation
+                || $0.value == 0x200D
+                || $0.value == 0xFE0F
+                || $0.value == 0x20E3
+        }
+        if isEmojiSequence {
+            let containsOrdinaryLetter = scalars.contains {
+                CharacterSet.letters.contains($0)
+                    && !$0.properties.isEmoji
+                    && $0.value != 0x200D
+                    && $0.value != 0xFE0F
+                    && $0.value != 0x20E3
+            }
+            if !containsOrdinaryLetter { return true }
+        }
+
+        var hasSymbol = false
+        for scalar in scalars {
+            if CharacterSet.alphanumerics.contains(scalar) ||
+                CharacterSet.letters.contains(scalar) ||
+                CharacterSet.decimalDigits.contains(scalar) {
+                return false
+            }
+            if CharacterSet.symbols.contains(scalar) ||
+                CharacterSet.punctuationCharacters.contains(scalar) ||
+                CharacterSet.nonBaseCharacters.contains(scalar) ||
+                (0xE000...0xF8FF).contains(scalar.value) {
+                hasSymbol = true
+                continue
+            }
+            return false
+        }
+        return hasSymbol
+    }
+
+    /// Removes OCR line breaks that are only visual wrapping hints while
+    /// retaining explicit list-like structure.
+    public static func semanticText(_ text: String) -> String {
+        let lines = text
             .components(separatedBy: .newlines)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
-        if explicitLines.count == ordered.count {
-            return explicitLines
+        guard lines.count > 1 else { return lines.first ?? "" }
+
+        var result = ""
+        for line in lines {
+            if result.isEmpty {
+                result = line
+                continue
+            }
+            if isStructuredLine(line) {
+                result.append("\n")
+            } else if needsSpace(after: result.last, before: line.first) {
+                result.append(" ")
+            }
+            result.append(line)
         }
-        let widths = ordered.map { max(0.08, $0.boundingBox.width) }
-        let reflowed = reflow(text, lineWidthRatios: widths)
-        let lines = reflowed.components(separatedBy: "\n")
-        guard lines.count == ordered.count else { return [reflowed] }
-        return lines
+        return result
     }
 
-    private static func blocksBelongToSameParagraph(
-        _ lhs: RecognizedTextBlock,
-        _ rhs: RecognizedTextBlock
-    ) -> Bool {
-        let lhsBox = lhs.boundingBox
-        let rhsBox = rhs.boundingBox
-        let maximumHeight = max(lhsBox.height, rhsBox.height)
-        let minimumHeight = max(0.0001, min(lhsBox.height, rhsBox.height))
-        let heightRatio = maximumHeight / minimumHeight
-        let sameLine = abs(lhsBox.midY - rhsBox.midY) <= maximumHeight * 0.55
-
-        if sameLine {
-            let horizontalGap = max(lhsBox.minX, rhsBox.minX) - min(lhsBox.maxX, rhsBox.maxX)
-            return horizontalGap <= max(0.015, maximumHeight * 1.25)
+    /// Removes all visual line wrapping from one semantic paragraph. Natural
+    /// layout is decided later from the paragraph rectangle, so cloud or OCR
+    /// line breaks can never force an early break or strand the final words.
+    public static func continuousText(_ text: String) -> String {
+        let lines = text
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        var result = ""
+        for line in lines {
+            if needsSpace(after: result.last, before: line.first) { result.append(" ") }
+            result.append(line)
         }
-
-        let upperBox = lhsBox.midY > rhsBox.midY ? lhsBox : rhsBox
-        let lowerBox = lhsBox.midY > rhsBox.midY ? rhsBox : lhsBox
-        let verticalGap = upperBox.minY - lowerBox.maxY
-        guard verticalGap >= -maximumHeight * 0.35,
-              verticalGap <= maximumHeight * 2.5,
-              heightRatio <= 1.65 else { return false }
-
-        let overlap = max(0, min(upperBox.maxX, lowerBox.maxX) - max(upperBox.minX, lowerBox.minX))
-        let overlapRatio = overlap / max(0.0001, min(upperBox.width, lowerBox.width))
-        let leftAligned = abs(upperBox.minX - lowerBox.minX) <= max(0.025, maximumHeight * 1.6)
-        return leftAligned || overlapRatio >= 0.30
+        return result
     }
 
     private static func makeParagraph(from blocks: [RecognizedTextBlock]) -> RecognizedTextParagraph {
@@ -146,9 +188,7 @@ public enum OCRParagraphLayout {
             id: ordered[0].id,
             text: paragraphText(from: ordered),
             boundingBox: union(of: ordered.map(\.boundingBox)),
-            blocks: ordered,
-            lineCount: spatialLineCount(in: ordered),
-            lineWidthRatios: lineWidthRatios(in: ordered)
+            blocks: ordered
         )
     }
 
@@ -168,6 +208,12 @@ public enum OCRParagraphLayout {
         return true
     }
 
+    private static func isStructuredLine(_ line: String) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let first = trimmed.first, "-•*·".contains(first) { return true }
+        return trimmed.range(of: "^\\d+[.)]\\s+", options: .regularExpression) != nil
+    }
+
     private static func isCJK(_ character: Character) -> Bool {
         character.unicodeScalars.contains { scalar in
             switch scalar.value {
@@ -177,40 +223,6 @@ public enum OCRParagraphLayout {
                 false
             }
         }
-    }
-
-    private static func spatialLineCount(in blocks: [RecognizedTextBlock]) -> Int {
-        guard let first = blocks.first else { return 1 }
-        var count = max(1, first.text.components(separatedBy: "\n").count)
-        var previous = first
-        for block in blocks.dropFirst() {
-            let tolerance = max(previous.boundingBox.height, block.boundingBox.height) * 0.55
-            if abs(previous.boundingBox.midY - block.boundingBox.midY) > tolerance {
-                count += max(1, block.text.components(separatedBy: "\n").count)
-            }
-            previous = block
-        }
-        return count
-    }
-
-    private static func lineWidthRatios(in blocks: [RecognizedTextBlock]) -> [CGFloat] {
-        let lines = spatialLines(in: blocks)
-        let widest = max(0.0001, lines.map(\.width).max() ?? 1)
-        return lines.map { max(0.08, $0.width / widest) }
-    }
-
-    private static func spatialLines(in blocks: [RecognizedTextBlock]) -> [CGRect] {
-        guard let first = blocks.first else { return [] }
-        var lines = [first.boundingBox]
-        for block in blocks.dropFirst() {
-            let tolerance = max(lines[lines.count - 1].height, block.boundingBox.height) * 0.55
-            if abs(lines[lines.count - 1].midY - block.boundingBox.midY) <= tolerance {
-                lines[lines.count - 1] = lines[lines.count - 1].union(block.boundingBox)
-            } else {
-                lines.append(block.boundingBox)
-            }
-        }
-        return lines
     }
 
     private static func balancedLines(

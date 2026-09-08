@@ -30,6 +30,14 @@ let package = Package(
                 .linkedFramework("Translation"),
                 .linkedFramework("WebKit")
             ]
+        ),
+        .testTarget(
+            name: "HelloXCoreTests",
+            dependencies: ["HelloXCore"]
+        ),
+        .testTarget(
+            name: "HelloXAppTests",
+            dependencies: ["HelloXApp"]
         )
     ]
 )

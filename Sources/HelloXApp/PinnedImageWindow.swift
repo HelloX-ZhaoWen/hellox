@@ -91,15 +91,17 @@ final class PinnedImageWindowController: NSWindowController, NSWindowDelegate {
         panel.isReleasedWhenClosed = false
         super.init(window: panel)
         panel.delegate = self
-        let contentView = PinnedImageHostingView(rootView: PinnedImageView(
-            image: image,
-            model: model,
-            close: { [weak panel] in panel?.close() },
-            edit: { [weak self] in self?.editImage() },
-            copy: { [weak self] in self?.copyImage() },
-            save: { [weak self] in self?.saveImage() },
-            toggleLayer: { [weak self] in self?.toggleLayer() }
-        ))
+        let contentView = PinnedImageHostingView(
+            rootView: PinnedImageView(
+                image: image,
+                model: model,
+                close: { [weak panel] in panel?.close() },
+                edit: { [weak self] in self?.editImage() },
+                copy: { [weak self] in self?.copyImage() },
+                save: { [weak self] in self?.saveImage() },
+                toggleLayer: { [weak self] in self?.toggleLayer() }
+            )
+        )
         panel.contentView = contentView
         HelloXWindowStyle.apply(to: panel, movableByBackground: true)
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
@@ -169,7 +171,7 @@ final class PinnedImageWindowController: NSWindowController, NSWindowDelegate {
 
     private func showError(_ message: String) {
         model.errorMessage = message
-        let alert = NSAlert()
+        let alert = HelloXAlert()
         alert.alertStyle = .warning
         alert.messageText = "贴图操作失败"
         alert.informativeText = message
@@ -322,8 +324,8 @@ private struct PinnedImageView: View {
 
                 if hovering {
                     HStack(spacing: 4) {
-                        HelloXIconButton(icon: .edit, help: "编辑贴图", size: 30, iconSize: 14, action: edit)
-                        HelloXIconButton(icon: .close, help: "关闭贴图", role: .destructive, size: 30, iconSize: 14, action: close)
+                        HelloXIconButton(icon: .edit, help: "编辑贴图", size: 30, iconSize: 16, action: edit)
+                        HelloXIconButton(icon: .close, help: "关闭贴图", role: .destructive, size: 30, iconSize: 16, action: close)
                     }
                     .padding(6)
                 }
@@ -333,10 +335,8 @@ private struct PinnedImageView: View {
             .background(
                 PinnedImageScrollMonitor { deltaY in
                     let multiplier: CGFloat = deltaY > 0 ? 0.9 : 1.1
-                    withAnimation(.easeOut(duration: 0.1)) {
-                        updateZoom(zoomScale * multiplier, viewportSize: viewportSize)
-                        lastZoomScale = zoomScale
-                    }
+                    updateZoom(zoomScale * multiplier, viewportSize: viewportSize)
+                    lastZoomScale = zoomScale
                 }
                 .allowsHitTesting(false)
             )
@@ -352,7 +352,7 @@ private struct PinnedImageView: View {
         .contextMenu {
             Button("编辑", action: edit)
             Button("复制", action: copy)
-            Button("保存…", action: save)
+            Button("保存", action: save)
             Divider()
             Button(model.isDesktopLayer ? "切换为始终置顶" : "切换到桌面层", action: toggleLayer)
             Button("关闭", action: close)

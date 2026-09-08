@@ -135,7 +135,9 @@ final class ScreenRecordingControlWindowController: NSObject {
         borderPanel.ignoresMouseEvents = true
         borderPanel.hidesOnDeactivate = false
         borderPanel.isReleasedWhenClosed = false
-        borderPanel.contentView = NSHostingView(rootView: ScreenRecordingBorderView())
+        borderPanel.contentView = NSHostingView(
+            rootView: ScreenRecordingBorderView()
+        )
 
         controlPanel.level = .screenSaver
         controlPanel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
@@ -144,12 +146,14 @@ final class ScreenRecordingControlWindowController: NSObject {
         controlPanel.hasShadow = false
         controlPanel.hidesOnDeactivate = false
         controlPanel.isReleasedWhenClosed = false
-        controlPanel.contentView = NSHostingView(rootView: ScreenRecordingControlView(
-            model: model,
-            pixelSizeText: "\(Int(selectionFrame.width)) × \(Int(selectionFrame.height))",
-            close: { [weak self] in self?.closeAndCancel() },
-            toggleRecording: { [weak self] in self?.toggleRecording() }
-        ))
+        controlPanel.contentView = NSHostingView(
+            rootView: ScreenRecordingControlView(
+                model: model,
+                pixelSizeText: "\(Int(selectionFrame.width)) × \(Int(selectionFrame.height))",
+                close: { [weak self] in self?.closeAndCancel() },
+                toggleRecording: { [weak self] in self?.toggleRecording() }
+            )
+        )
     }
 
     private func toggleRecording() {
@@ -242,7 +246,7 @@ final class ScreenRecordingControlWindowController: NSObject {
 private struct ScreenRecordingBorderView: View {
     var body: some View {
         Rectangle()
-            .strokeBorder(HelloXTheme.accent, lineWidth: 3)
+            .strokeBorder(HelloXTheme.error, lineWidth: 3)
             .background(Color.clear)
             .accessibilityHidden(true)
     }
@@ -254,14 +258,11 @@ private struct ScreenRecordingControlView: View {
     let close: () -> Void
     let toggleRecording: () -> Void
     @Environment(\.colorScheme) private var colorScheme
-    private let toolbarPrimaryText = Color(red: 15 / 255, green: 23 / 255, blue: 42 / 255)
-    private let toolbarSecondaryText = Color(red: 71 / 255, green: 85 / 255, blue: 105 / 255)
 
     var body: some View {
         HStack(spacing: CaptureToolbarLayout.buttonSpacing) {
-            Circle()
-                .fill(model.phase == .recording ? HelloXTheme.error : toolbarSecondaryText)
-                .frame(width: 12, height: 12)
+            HelloXIcon(icon: .recording, size: 16)
+                .foregroundStyle(model.phase == .recording ? HelloXTheme.error : HelloXTheme.iconForeground(for: .dark))
                 .shadow(
                     color: model.phase == .recording ? HelloXTheme.error.opacity(0.35) : .clear,
                     radius: 5
@@ -269,10 +270,10 @@ private struct ScreenRecordingControlView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(model.statusText)
                     .font(.system(size: 13, weight: .bold, design: .monospaced))
-                    .foregroundStyle(toolbarPrimaryText)
+                    .foregroundStyle(Color.white)
                 Text(pixelSizeText)
                     .font(.system(size: 10, weight: .medium, design: .monospaced))
-                    .foregroundStyle(toolbarSecondaryText)
+                    .foregroundStyle(Color(red: 139 / 255, green: 152 / 255, blue: 165 / 255))
             }
             Spacer(minLength: 4)
             recordingButton(
@@ -301,11 +302,12 @@ private struct ScreenRecordingControlView: View {
         .padding(.horizontal, 14)
         .frame(width: ScreenRecordingControlGeometry.controlSize.width, height: ScreenRecordingControlGeometry.controlSize.height)
         .background(
-            Color(red: 0.97, green: 0.98, blue: 0.99),
-            in: RoundedRectangle(cornerRadius: 15, style: .continuous)
+            Color.black.opacity(0.96),
+            in: Capsule()
         )
-        .overlay(RoundedRectangle(cornerRadius: 15).stroke(HelloXTheme.border(for: colorScheme)))
-        .shadow(color: .black.opacity(colorScheme == .dark ? 0.34 : 0.18), radius: 18, y: 8)
+        .overlay(Capsule().stroke(Color.white.opacity(0.10), lineWidth: 1))
+        .shadow(color: .black.opacity(0.30), radius: 18, y: 8)
+        .environment(\.colorScheme, .dark)
     }
 
     private func recordingButton(

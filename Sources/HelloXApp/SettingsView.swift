@@ -3,32 +3,20 @@ import HelloXCore
 import SwiftUI
 
 enum SettingsDestination: String, CaseIterable, Identifiable {
-    case workbench, shortcuts, intelligence, software
-
+    case shortcuts, dynamicIsland, intelligence, software
     var id: String { rawValue }
-
     var title: String {
         switch self {
-        case .workbench: "工作台"
         case .shortcuts: "快捷键"
-        case .intelligence: "翻译配置"
+        case .dynamicIsland: "灵动岛"
+        case .intelligence: "翻译设置"
         case .software: "软件与更新"
         }
     }
-
-    var subtitle: String {
-        switch self {
-        case .workbench: "快速使用截图、图片处理与常用转换工具。"
-        case .shortcuts: "录入后立即验证并生效，无需单独保存。"
-        case .intelligence: "管理 AI 翻译服务和连接配置。"
-        case .software: "查看版本信息，并安全检查软件更新。"
-        }
-    }
-
     var icon: HelloXIconKey {
         switch self {
-        case .workbench: .capture
         case .shortcuts: .shortcuts
+        case .dynamicIsland: .dynamicIsland
         case .intelligence: .translation
         case .software: .settings
         }
@@ -38,487 +26,316 @@ enum SettingsDestination: String, CaseIterable, Identifiable {
 struct SettingsView: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.colorScheme) private var colorScheme
+    @State private var shortcutSearch = ""
+    @State private var appearanceMode = HelloXAppearance.mode
+    @State private var settingsSearch = ""
+    @State private var selectedSearchID: String?
+    @State private var searchNavigationID = UUID()
+    @FocusState private var focusedSearchID: String?
+    @FocusState private var focusedDestination: SettingsDestination?
+
+    init(searchQuery: String = "") {
+        _settingsSearch = State(initialValue: searchQuery)
+    }
 
     var body: some View {
-        ZStack {
-            HelloXGlowBackground()
-                .ignoresSafeArea()
-            HStack(spacing: 0) {
-                sidebar
-                    .frame(width: 236)
-                detail
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
+        // Width is fixed, as in Codex. NSSplitView inserts a titlebar-safe inset
+        // into each pane even in a full-size-content window, leaving a white band.
+        HStack(spacing: 0) {
+            sidebar.frame(width: SettingsWindowLayout.sidebarWidth)
+            detail.frame(minWidth: 540, maxWidth: .infinity, maxHeight: .infinity)
         }
+        .ignoresSafeArea()
+        .font(HXTypography.body)
+        .foregroundStyle(HXTextStyle.primary)
+        .buttonStyle(HelloXButtonStyle())
         .tint(HelloXTheme.accent)
-        .frame(minWidth: 960, minHeight: 660)
+        .background(HelloXTheme.pageBackground(for: colorScheme))
+    }
+
+    private var isSearching: Bool {
+        !settingsSearch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var searchResults: [SettingsSearchResult] {
+        SettingsSearchIndex.results(for: settingsSearch, profiles: model.translationProfiles,
+                                    bindings: model.shortcutBindings)
+    }
+
+    private func selectSearchResult(_ result: SettingsSearchResult) {
+        shortcutSearch = ""
+        model.mainDestination = result.destination
+        selectedSearchID = result.id
+        searchNavigationID = UUID()
     }
 
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 13) {
-                Image(nsImage: NSApp.applicationIconImage)
-                    .resizable()
-                    .interpolation(.high)
-                    .scaledToFit()
-                    .frame(width: 42, height: 42)
-                    .accessibilityHidden(true)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("HelloX")
-                        .font(.system(size: 18, weight: .bold))
-                        .foregroundStyle(HelloXTheme.primaryText(for: colorScheme))
-                    Text(HelloXBrand.slogan)
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
-                        .lineLimit(1)
+            Text("HelloX").font(HXTypography.control)
+                .padding(.horizontal, 16)
+                .frame(height: 28)
+            HXSearchField("搜索设置…", text: $settingsSearch)
+            .onSubmit {
+                if let first = searchResults.first { selectSearchResult(first) }
+            }
+            .padding(.horizontal, 8)
+            .padding(.top, 8)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(isSearching ? "搜索结果" : "设置").font(HXTypography.sidebar)
+                        .foregroundStyle(HelloXTheme.sidebarSectionForeground(for: colorScheme))
+                        .padding(.horizontal, 8).frame(height: 24)
+                    if isSearching {
+                        ForEach(searchResults) { result in
+                            Button { selectSearchResult(result) } label: {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(result.title).font(HXTypography.sidebar)
+                                        .foregroundStyle(HXTextStyle.primary)
+                                    Text(result.destination.title).font(HXTypography.caption)
+                                        .foregroundStyle(HXTextStyle.secondary)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(8)
+                                .background(selectedSearchID == result.id
+                                    ? HelloXTheme.sidebarSelectedBackground(for: colorScheme) : .clear,
+                                    in: RoundedRectangle(cornerRadius: 10))
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .focused($focusedSearchID, equals: result.id)
+                            .accessibilityLabel(result.location)
+                        }
+                        if searchResults.isEmpty {
+                            Text("未找到匹配设置或功能").font(HXTypography.caption)
+                                .foregroundStyle(HXTextStyle.secondary).padding(8)
+                        }
+                    } else {
+                        ForEach(SettingsDestination.allCases) { destination in
+                            HXSidebarRow(title: destination.title, icon: destination.icon,
+                                         isSelected: model.mainDestination == destination) {
+                                model.mainDestination = destination
+                                selectedSearchID = nil
+                            }
+                            .focused($focusedDestination, equals: destination)
+                        }
+                    }
                 }
+                .padding(.horizontal, 8)
             }
-            .padding(.horizontal, 18)
-            .padding(.top, 24)
-            .padding(.bottom, 30)
-
-            VStack(spacing: 6) {
-                ForEach(SettingsDestination.allCases) { destination in
-                    SettingsSidebarButton(
-                        destination: destination,
-                        isSelected: model.mainDestination == destination,
-                        action: { model.mainDestination = destination }
-                    )
+            .codexScrollChrome()
+            .padding(.top, 16)
+            .onMoveCommand { direction in
+                if isSearching {
+                    let results = searchResults
+                    guard !results.isEmpty, direction == .down || direction == .up else { return }
+                    let index = results.firstIndex { $0.id == focusedSearchID } ?? (direction == .down ? -1 : results.count)
+                    let next = results[min(max(index + (direction == .down ? 1 : -1), 0), results.count - 1)]
+                    focusedSearchID = next.id
+                    selectSearchResult(next)
+                    return
                 }
+                let destinations = SettingsDestination.allCases
+                guard !destinations.isEmpty else { return }
+                let index = destinations.firstIndex(of: focusedDestination ?? model.mainDestination) ?? 0
+                let step = direction == .down ? 1 : direction == .up ? -1 : 0
+                guard step != 0 else { return }
+                let next = destinations[min(max(index + step, 0), destinations.count - 1)]
+                model.mainDestination = next
+                focusedDestination = next
             }
-            .padding(.horizontal, 12)
-
-            Spacer()
-
-            HStack(spacing: 8) {
-                Circle()
-                    .fill(HelloXTheme.success)
-                    .frame(width: 7, height: 7)
-                Text("版本 \(model.currentVersion)")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
-            }
-            .padding(18)
         }
-        .frame(maxHeight: .infinity)
-        .background(HelloXTheme.surface(for: colorScheme))
-        .overlay(alignment: .trailing) {
-            Rectangle()
-                .fill(HelloXTheme.border(for: colorScheme))
-                .frame(width: 1)
-        }
+        .padding(.top, 48)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(HXSidebarMaterial())
     }
 
     private var detail: some View {
-        let destination = model.mainDestination
-        return ScrollView(.vertical, showsIndicators: false) {
-            Group {
-                switch destination {
-                case .workbench: workbenchPage
-                case .shortcuts: shortcutsPage
-                case .intelligence:
-                    VStack(alignment: .leading, spacing: 20) {
-                        pageHeader("翻译配置", subtitle: "管理云端翻译服务、模型和连接凭据")
-                        IntelligenceSettingsView()
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 32) {
+                    Text(model.mainDestination.title).font(HXTypography.title)
+                        .id("page-" + model.mainDestination.rawValue)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Group {
+                        switch model.mainDestination {
+                        case .shortcuts: shortcutsPage
+                        case .intelligence: IntelligenceSettingsView()
+                        case .software: softwarePage
+                        case .dynamicIsland:
+                            DynamicIslandSettingsCard(initialSection: selectedSearchID == "island-tools" ? .helloX : .menuBar)
+                                .frame(minHeight: 540)
+                        }
                     }
-                case .software: softwarePage
                 }
+                .frame(maxWidth: 768, alignment: .leading)
+                .padding(.horizontal, 40).padding(.top, 64).padding(.bottom, 40)
+                .frame(maxWidth: .infinity, alignment: .top)
             }
-            .frame(maxWidth: 920, alignment: .leading)
-            .padding(.horizontal, 42)
-            .padding(.top, 42)
-            .padding(.bottom, 46)
-            .frame(maxWidth: .infinity, alignment: .top)
-        }
-        .scrollContentBackground(.hidden)
-        .seamlessScrollChrome()
-    }
-
-    private var workbenchPage: some View {
-        VStack(alignment: .leading, spacing: 24) {
-            pageHeader("工作台", subtitle: "选择一项任务，立即开始处理")
-
-            HStack(spacing: 12) {
-                primaryCaptureCard
-                recordingCard
-                    .frame(width: 275)
-            }
-
-            VStack(alignment: .leading, spacing: 11) {
-                sectionHeader("文字智能", trailing: "输入、截图或划词，快速获得译文")
-                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
-                    textActionButton(
-                        "文字提取",
-                        detail: "识别屏幕中的文字并复制",
-                        icon: .textRecognition,
-                        action: model.captureAndOCR
-                    )
-                    textActionButton(
-                        "文本翻译",
-                        detail: "输入或粘贴文字，多模型同时翻译",
-                        icon: .translation,
-                        action: model.showTextTranslation
-                    )
-                    textActionButton(
-                        "截图翻译",
-                        detail: "框选屏幕文字并直接翻译",
-                        icon: .translation,
-                        action: model.captureAndTranslate
-                    )
-                    textActionButton(
-                        "划词翻译",
-                        detail: "读取当前选区并显示译文",
-                        icon: .translation,
-                        action: model.translateSelectedText
-                    )
-                }
-            }
-
-            VStack(alignment: .leading, spacing: 11) {
-                sectionHeader("效率工具", trailing: "6 项本地工具")
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 220), spacing: 10)], spacing: 10) {
-                    utilityButton("图片加水印", detail: "添加文字或图片水印", icon: .watermark, action: model.importImageForWatermark)
-                    utilityButton("CSV 转 Excel", detail: "导出标准 XLSX 工作簿", icon: .save) { model.showUtilityTool(.csvToExcel) }
-                    utilityButton("Base64 转换", detail: "文本编码与解码", icon: .copy) { model.showUtilityTool(.base64) }
-                    utilityButton("二维码识别", detail: "从图片中读取二维码", icon: .qrCode) { model.showUtilityTool(.qrCode) }
-                    utilityButton("密码生成", detail: "生成安全随机密码", icon: .privacy) { model.showUtilityTool(.password) }
-                    utilityButton("Markdown 转换", detail: "实时预览并导出 HTML", icon: .text) { model.showUtilityTool(.markdown) }
+            .codexScrollChrome()
+            .background(HelloXTheme.pageBackground(for: colorScheme))
+            .onChange(of: searchNavigationID) { _, _ in
+                guard let id = selectedSearchID else { return }
+                DispatchQueue.main.async {
+                    withAnimation { proxy.scrollTo(id, anchor: .top) }
                 }
             }
         }
     }
 
     private var shortcutsPage: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            pageHeader("全局快捷键", subtitle: "录入后立即验证并生效，无需单独保存")
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("快捷键列表")
-                        .font(.system(size: 14, weight: .semibold))
-                    Text("点击右侧录入框后按下组合键")
-                        .font(.system(size: 11))
-                        .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
-                }
-                Spacer()
-                Button(action: model.resetAllShortcuts) {
-                    Text("恢复默认")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
-                        .padding(.horizontal, 10)
-                        .frame(height: 28)
-                        .background(
-                            HelloXTheme.controlBackground(for: colorScheme),
-                            in: RoundedRectangle(cornerRadius: 7, style: .continuous)
-                        )
-                }
-                .buttonStyle(.plain)
-                .help("将全部快捷键恢复为默认值")
+        VStack(alignment: .leading, spacing: 40) {
+            HStack(spacing: 12) {
+                HXSearchField("搜索功能或快捷键", text: $shortcutSearch)
+                Button("恢复默认", action: model.resetAllShortcuts)
+                    .id("shortcut-reset")
+                    .help("将全部快捷键恢复为默认值")
             }
-
-            LazyVGrid(
-                columns: [
-                    GridItem(.flexible(), spacing: 10),
-                    GridItem(.flexible())
-                ],
-                spacing: 10
-            ) {
-                ForEach(ShortcutAction.configurableCases) { action in
-                    shortcutRow(action)
-                }
-            }
-        }
-    }
-
-    private var softwarePage: some View {
-        VStack(alignment: .leading, spacing: 22) {
-            pageHeader("软件与更新", subtitle: "查看版本信息，并安全检查正式版本更新")
-            HelloXCard(showsBorder: false) {
-                HStack(spacing: 18) {
-                    Image(nsImage: NSApp.applicationIconImage)
-                        .resizable()
-                        .interpolation(.high)
-                        .scaledToFit()
-                        .frame(width: 72, height: 72)
-                        .accessibilityHidden(true)
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("HelloX")
-                            .font(.system(size: 21, weight: .bold))
-                        Text("版本 \(model.currentVersion)")
-                            .font(.system(size: 12))
-                            .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
-                        Text(HelloXBrand.slogan)
-                            .font(.system(size: 12))
-                            .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
-                    }
-                }
-            }
-
-            HelloXSection(title: "权限状态", showsBorder: false) {
+            if filteredShortcutActions.isEmpty {
                 VStack(spacing: 10) {
-                    permissionRow(
-                        icon: .screen,
-                        title: "屏幕录制",
-                        subtitle: "截图和录屏需要此权限",
-                        granted: model.permissions.canRecordScreen,
-                        action: { model.permissions.openScreenRecordingSettings() }
-                    )
-                    permissionRow(
-                        icon: .capture,
-                        title: "辅助功能",
-                        subtitle: "滚动截图和文字翻译需要此权限",
-                        granted: model.permissions.canUseAccessibility,
-                        action: { model.permissions.openAccessibilitySettings() }
-                    )
+                    HelloXIcon(icon: .search, size: 28)
+                    Text("未找到匹配功能或快捷键").font(HXTypography.body)
                 }
-            }
-
-            HelloXSection(title: "软件更新", showsBorder: false) {
-                HStack(spacing: 13) {
-                    HelloXRowIcon(icon: .update, size: 42)
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(model.updateState.message ?? "从 GitHub Releases 检查正式版本")
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundStyle(updateMessageColor)
-                        Text("安装前会验证完整性、签名、公证和双架构。")
-                            .font(.system(size: 11))
-                            .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
-                    }
-                    Spacer()
-                    if isUpdating { ProgressView().controlSize(.small) }
-                    if case .available = model.updateState {
-                        HelloXIconButton(icon: .save, help: "立即更新", role: .accent) { model.installAvailableUpdate() }
-                            .disabled(isUpdating)
-                    } else {
-                        HelloXIconButton(icon: .update, help: "检查更新", isBorderless: true) { model.checkForUpdates() }
-                            .disabled(isUpdating)
+                .foregroundStyle(HXTextStyle.secondary)
+                .frame(maxWidth: .infinity, minHeight: 140)
+            } else {
+                HXSettingsGroup(title: "全局快捷键", footer: "点击快捷键后按下新的组合键，按 Delete 清空，按 Esc 取消。") {
+                    ForEach(filteredShortcutActions) { action in
+                        shortcutRow(action).id("shortcut-" + action.rawValue)
+                        if action != filteredShortcutActions.last { HXSettingsDivider() }
                     }
                 }
             }
-
-            HelloXSection(title: "项目链接", showsBorder: false) {
-                HStack(spacing: 22) {
-                    Link(destination: URL(string: "https://github.com/HelloX-ZhaoWen/hellox")!) {
-                        HStack(spacing: 7) { HelloXIcon(icon: .link, size: 15); Text("项目主页") }
-                    }
-                    Link(destination: URL(string: "https://github.com/HelloX-ZhaoWen/hellox#隐私与数据")!) {
-                        HStack(spacing: 7) { HelloXIcon(icon: .privacy, size: 15); Text("隐私说明") }
-                    }
-                }
-                .font(.system(size: 12, weight: .medium))
-            }
         }
     }
 
-    private var primaryCaptureCard: some View {
-        Button { model.startCapture(.region) } label: {
-            HStack(spacing: 18) {
-                VStack(alignment: .leading, spacing: 7) {
-                    Text("区域截图")
-                        .font(.system(size: 20, weight: .bold))
-                    Text("自由框选屏幕区域并直接标注")
-                        .font(.system(size: 12))
-                        .foregroundStyle(.white.opacity(0.80))
-                }
-                Spacer()
-                HelloXIcon(icon: .capture, size: 32)
-                    .frame(width: 72, height: 72)
-                    .background(.white.opacity(0.15), in: RoundedRectangle(cornerRadius: 19, style: .continuous))
-            }
-            .foregroundStyle(.white)
-            .padding(.horizontal, 22)
-            .frame(maxWidth: .infinity, minHeight: 150)
-            .background(
-                LinearGradient(colors: [HelloXTheme.accent, Color(red: 76 / 255, green: 154 / 255, blue: 245 / 255)], startPoint: .topLeading, endPoint: .bottomTrailing),
-                in: RoundedRectangle(cornerRadius: HelloXTheme.cardRadius, style: .continuous)
-            )
-            .shadow(color: HelloXTheme.accent.opacity(0.18), radius: 14, y: 7)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .allowsHitTesting(!model.isBusy)
-        .accessibilityLabel("区域截图，自由框选屏幕区域并直接标注")
-    }
-
-    private var recordingCard: some View {
-        Button(action: model.startScreenRecording) {
-            VStack(alignment: .leading, spacing: 0) {
-                HStack(alignment: .top) {
-                    HelloXRowIcon(icon: .recording, size: 42)
-                    Spacer()
-                    Text(model.shortcutBindings[.screenRecording]?.displayName ?? "未设置")
-                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                        .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
-                        .padding(.horizontal, 8)
-                        .frame(height: 25)
-                        .background(HelloXTheme.controlBackground(for: colorScheme), in: RoundedRectangle(cornerRadius: 7))
-                }
-                Spacer()
-                Text("选区录屏")
-                    .font(.system(size: 16, weight: .bold))
-                    .foregroundStyle(HelloXTheme.primaryText(for: colorScheme))
-                Text("框选区域并录制为 MP4")
-                    .font(.system(size: 11))
-                    .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
-                    .padding(.top, 3)
-            }
-            .padding(18)
-            .frame(maxWidth: .infinity, minHeight: 150, alignment: .leading)
-            .background(HelloXTheme.raisedSurface(for: colorScheme), in: RoundedRectangle(cornerRadius: HelloXTheme.cardRadius, style: .continuous))
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .allowsHitTesting(!model.isBusy)
-    }
-
-    private func textActionButton(
-        _ title: String,
-        detail: String,
-        icon: HelloXIconKey,
-        action: @escaping () -> Void
-    ) -> some View {
-        Button(action: action) {
-            HStack(spacing: 11) {
-                HelloXRowIcon(icon: icon)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(title)
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(HelloXTheme.primaryText(for: colorScheme))
-                    Text(detail)
-                        .font(.system(size: 11))
-                        .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
-                }
-                Spacer(minLength: 8)
-                HelloXIcon(icon: .chevronRight, size: 15)
-                    .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme).opacity(0.75))
-            }
-            .padding(.horizontal, 16)
-            .frame(maxWidth: .infinity, minHeight: 72)
-            .background(HelloXTheme.raisedSurface(for: colorScheme), in: RoundedRectangle(cornerRadius: HelloXTheme.cardRadius, style: .continuous))
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .allowsHitTesting(!model.isBusy)
-    }
-
-    private func utilityButton(
-        _ title: String,
-        detail: String,
-        icon: HelloXIconKey,
-        action: @escaping () -> Void
-    ) -> some View {
-        Button(action: action) {
-            HStack(spacing: 11) {
-                HelloXRowIcon(icon: icon, size: 34)
-                    .background(HelloXTheme.raisedSurface(for: colorScheme), in: RoundedRectangle(cornerRadius: 9))
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(title)
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(HelloXTheme.primaryText(for: colorScheme))
-                    Text(detail)
-                        .font(.system(size: 10.5))
-                        .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
-                }
-                Spacer(minLength: 4)
-            }
-            .padding(.horizontal, 13)
-            .frame(maxWidth: .infinity, minHeight: 66)
-            .background(HelloXTheme.controlBackground(for: colorScheme), in: RoundedRectangle(cornerRadius: HelloXTheme.controlRadius, style: .continuous))
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .allowsHitTesting(!model.isBusy)
-    }
-
-    private func pageHeader(_ title: String, subtitle: String) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text(title)
-                .font(.system(size: 27, weight: .bold))
-                .foregroundStyle(HelloXTheme.primaryText(for: colorScheme))
-            Text(subtitle)
-                .font(.system(size: 12.5))
-                .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
-        }
-    }
-
-    private func sectionHeader(_ title: String, trailing: String) -> some View {
-        HStack(alignment: .firstTextBaseline) {
-            Text(title)
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(HelloXTheme.primaryText(for: colorScheme))
-            Spacer()
-            Text(trailing)
-                .font(.system(size: 10.5))
-                .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
+    private var filteredShortcutActions: [ShortcutAction] {
+        let query = shortcutSearch.trimmingCharacters(in: .whitespacesAndNewlines)
+        return ShortcutAction.configurableCases.filter { action in
+            query.isEmpty || "\(action.settingsTitle) \(action.settingsDescription) \(model.shortcutBindings[action]?.displayName ?? "")"
+                .localizedCaseInsensitiveContains(query)
         }
     }
 
     private func shortcutRow(_ action: ShortcutAction) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 9) {
-                HelloXRowIcon(icon: action.icon, size: 36)
+            HStack(spacing: 12) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(action.title)
-                        .font(.system(size: 13, weight: .semibold))
-                    Text(action.defaultBinding.map { "默认 \($0.displayName)" } ?? "默认未设置")
-                        .font(.system(size: 11))
-                        .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
+                    Text(action.settingsTitle).font(HXTypography.label)
+                    Text(action.settingsDescription).font(HXTypography.caption).foregroundStyle(HXTextStyle.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                Spacer()
-                ShortcutRecorder(
-                    binding: Binding(
-                        get: { model.shortcutBindings[action] },
-                        set: { value in
-                            if let value { model.setShortcut(action, binding: value) }
-                            else { model.clearShortcut(action) }
-                        }
-                    ),
-                    hasConflict: model.shortcutConflictMessages[action] != nil
-                )
-                .frame(width: 152, height: 32)
+                Spacer(minLength: 12)
+                ShortcutRecorder(binding: Binding(
+                    get: { model.shortcutBindings[action] },
+                    set: { value in
+                        if let value { model.setShortcut(action, binding: value) }
+                        else { model.clearShortcut(action) }
+                    }
+                ), hasConflict: model.shortcutConflictMessages[action] != nil)
+                .frame(width: 112, height: 28)
+                .accessibilityLabel("\(action.settingsTitle)快捷键")
             }
             if let message = model.shortcutConflictMessages[action] {
-                HStack(spacing: 6) {
-                    HelloXIcon(icon: .warning, size: 14)
-                    Text(message)
-                }
-                    .font(.system(size: 11))
-                    .foregroundStyle(HelloXTheme.error)
-                    .padding(.leading, 45)
-                    .accessibilityLabel("快捷键冲突：\(message)")
+                Label { Text(message) } icon: { HelloXIcon(icon: .warning, size: 14) }
+                    .font(HXTypography.caption).foregroundStyle(HelloXTheme.error)
             }
         }
-        .padding(.horizontal, 11)
-        .padding(.vertical, 7)
-        .frame(maxWidth: .infinity, minHeight: 52, alignment: .center)
-        .background(
-            HelloXTheme.controlBackground(for: colorScheme),
-            in: RoundedRectangle(cornerRadius: HelloXTheme.controlRadius, style: .continuous)
-        )
+        .padding(.horizontal, 16).padding(.vertical, 12)
     }
 
-    private func permissionRow(icon: HelloXIconKey, title: String, subtitle: String, granted: Bool, action: @escaping () -> Void) -> some View {
-        HStack(spacing: 13) {
-            HelloXRowIcon(icon: icon, size: 42)
-            VStack(alignment: .leading, spacing: 3) {
-                Text(title)
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(HelloXTheme.primaryText(for: colorScheme))
-                Text(subtitle)
-                    .font(.system(size: 11))
-                    .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
+    private var softwarePage: some View {
+        VStack(alignment: .leading, spacing: 40) {
+            HXSettingsGroup(title: "关于") {
+                HStack(spacing: 12) {
+                    Image(nsImage: NSApp.applicationIconImage)
+                        .resizable().scaledToFit().frame(width: 40, height: 40)
+                        .accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("HelloX").font(.system(size: 15, weight: .semibold))
+                        Text(HelloXBrand.slogan).font(HXTypography.caption).foregroundStyle(HXTextStyle.secondary)
+                    }
+                    Spacer()
+                    Text("版本 \(model.currentVersion)").foregroundStyle(HXTextStyle.secondary)
+                }
+                .padding(.horizontal, 16).padding(.vertical, 12)
             }
-            Spacer()
+            .id("software-about")
+            HXSettingsGroup(title: "外观", footer: "选择“跟随系统”时，HelloX 会随 macOS 自动切换外观。") {
+                HXSettingsRow(title: "应用外观") {
+                    HXDropdown(
+                        "应用外观",
+                        selection: appearanceModeBinding,
+                        options: HelloXAppearanceMode.allCases.map { HXDropdownOption($0, $0.title) }
+                    )
+                }
+            }
+            .id("software-appearance")
+            HXSettingsGroup(title: "权限") {
+                permissionRow(icon: .screen, title: "屏幕录制", subtitle: "用于截图和录屏",
+                              granted: model.permissions.canRecordScreen,
+                              action: model.requestScreenPermission)
+                    .id("permission-screen")
+                HXSettingsDivider()
+                permissionRow(icon: .capture, title: "辅助功能", subtitle: "用于滚动截图和划词翻译",
+                              granted: model.permissions.canUseAccessibility,
+                              action: model.requestAccessibilityPermission)
+                    .id("permission-accessibility")
+            }
+            HXSettingsGroup(title: "软件更新") {
+                HStack(spacing: 12) {
+                    HelloXRowIcon(icon: .update, size: 18)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(model.updateState.message ?? "检查是否有可用更新")
+                            .foregroundStyle(updateMessageColor)
+                        Text("当前版本 \(model.currentVersion)")
+                            .font(HXTypography.caption).foregroundStyle(HXTextStyle.secondary)
+                    }
+                    Spacer(minLength: 8)
+                    if isUpdating { ProgressView().controlSize(.small) }
+                    Button(updateActionTitle) {
+                        if case .available = model.updateState { model.installAvailableUpdate() }
+                        else { model.checkForUpdates() }
+                    }
+                    .disabled(isUpdating)
+                }
+                .padding(.horizontal, 16).padding(.vertical, 12)
+            }
+            .id("software-update")
+            HStack(spacing: 16) {
+                Link("项目主页", destination: URL(string: "https://github.com/HelloX-ZhaoWen/hellox")!)
+                Link("隐私说明", destination: URL(string: "https://github.com/HelloX-ZhaoWen/hellox#隐私与数据")!)
+            }
+            .font(HXTypography.caption).padding(.horizontal, 12)
+            .id("software-links")
+        }
+    }
+
+    private func permissionRow(icon: HelloXIconKey, title: String, subtitle: String,
+                               granted: Bool, action: @escaping () -> Void) -> some View {
+        HStack(spacing: 12) {
+            HelloXRowIcon(icon: icon, size: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                Text(subtitle).font(HXTypography.caption).foregroundStyle(HXTextStyle.secondary)
+            }
+            Spacer(minLength: 8)
             if granted {
                 HStack(spacing: 5) {
-                    HelloXIcon(icon: .success, size: 14)
+                    HelloXIcon(icon: .confirm, size: 12)
                     Text("已授权")
-                        .font(.system(size: 12, weight: .medium))
                 }
-                .foregroundStyle(HelloXTheme.success)
+                    .foregroundStyle(HXTextStyle.secondary)
+                    .font(HXTypography.control)
+                    .lineLimit(1)
+                    .frame(minHeight: 28)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel("\(title)，已授权")
             } else {
-                HelloXIconButton(icon: .settings, help: "前往授权", role: .accent) { action() }
+                Button("前往授权", action: action)
             }
         }
+        .padding(.horizontal, 16).padding(.vertical, 12)
     }
 
     private var isUpdating: Bool {
@@ -527,64 +344,18 @@ struct SettingsView: View {
         default: false
         }
     }
-
     private var updateMessageColor: Color {
         if case .failed = model.updateState { return HelloXTheme.error }
         return HelloXTheme.primaryText(for: colorScheme)
     }
-}
-
-private struct SettingsSidebarButton: View {
-    let destination: SettingsDestination
-    let isSelected: Bool
-    let action: () -> Void
-    @Environment(\.colorScheme) private var colorScheme
-    @State private var isHovering = false
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 12) {
-                HelloXIcon(icon: destination.icon, size: 19)
-                    .frame(width: 24)
-                Text(destination.title)
-                    .font(.system(size: 15, weight: isSelected ? .semibold : .medium))
-                Spacer()
-            }
-            .foregroundStyle(isSelected ? HelloXTheme.accent : HelloXTheme.secondaryText(for: colorScheme))
-            .padding(.horizontal, 14)
-            .frame(height: 52)
-            .background(
-                isSelected
-                    ? HelloXTheme.selectedBackground(for: colorScheme)
-                    : (isHovering ? HelloXTheme.controlBackground(for: colorScheme) : Color.clear),
-                in: RoundedRectangle(cornerRadius: HelloXTheme.controlRadius, style: .continuous)
-            )
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .onHover { isHovering = $0 }
-        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    private var updateActionTitle: String {
+        if case .available = model.updateState { return "立即更新" }
+        return "检查更新"
     }
-}
-
-private extension ShortcutAction {
-    var icon: HelloXIconKey {
-        switch self {
-        case .regionCapture: .capture
-        case .windowCapture: .window
-        case .fullScreenCapture: .screen
-        case .scrollingCapture: .scrolling
-        case .screenRecording: .recording
-        case .watermarkImage: .watermark
-        case .captureAndOCR: .textRecognition
-        case .textTranslation: .translation
-        case .captureAndTranslate: .translation
-        case .translateSelection: .translation
-        case .csvToExcel: .save
-        case .base64: .copy
-        case .qrCode: .qrCode
-        case .password: .privacy
-        case .markdown: .text
-        }
+    private var appearanceModeBinding: Binding<HelloXAppearanceMode> {
+        Binding(get: { appearanceMode }, set: {
+            appearanceMode = $0
+            HelloXAppearance.setMode($0)
+        })
     }
 }

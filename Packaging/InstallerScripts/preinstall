@@ -1,7 +1,9 @@
 #!/bin/zsh
 set -eu
 
+# 终止运行中的进程，但不删除应用包
+# pkg 安装器会通过 BundleOverwriteAction: upgrade 原地升级
 /usr/bin/pkill -x HelloX >/dev/null 2>&1 || true
-[[ -e /Applications/HelloX.app || -L /Applications/HelloX.app ]] && /bin/rm -rf /Applications/HelloX.app
+sleep 1
 
 exit 0

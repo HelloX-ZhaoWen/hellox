@@ -1,4 +1,3 @@
-import AppKit
 import CoreGraphics
 import Foundation
 
@@ -50,12 +49,27 @@ public struct RecognizedTextBlock: Codable, Equatable, Sendable, Identifiable {
     public let confidence: Float
     /// Vision coordinates: normalized, origin at bottom-left.
     public let boundingBox: CGRect
+    /// Character-level Vision rectangle for the semantic content after list
+    /// markers and transient carets have been excluded.
+    public let translatableBoundingBox: CGRect?
+    /// True when OCR recovered this observation as an independent interface
+    /// cell. Semantic paragraph grouping must not cross this boundary.
+    public let isLayoutIsolated: Bool?
 
-    public init(id: UUID = UUID(), text: String, confidence: Float, boundingBox: CGRect) {
+    public init(
+        id: UUID = UUID(),
+        text: String,
+        confidence: Float,
+        boundingBox: CGRect,
+        translatableBoundingBox: CGRect? = nil,
+        isLayoutIsolated: Bool? = nil
+    ) {
         self.id = id
         self.text = text
         self.confidence = confidence
         self.boundingBox = boundingBox
+        self.translatableBoundingBox = translatableBoundingBox
+        self.isLayoutIsolated = isLayoutIsolated
     }
 }
 
@@ -70,79 +84,6 @@ public struct OCRResult: Codable, Equatable, Sendable {
         self.language = language
         self.averageConfidence = averageConfidence
         self.blocks = blocks
-    }
-}
-
-/// A translated OCR block that keeps Vision's normalized, bottom-left-origin
-/// geometry so the translation can be rendered back onto the captured image.
-public struct ImageTranslationAppearance: Equatable, Sendable {
-    /// Font size in source-image pixels.
-    public let fontSize: CGFloat
-    public let foregroundColor: RGBAColor
-    public let backgroundColor: RGBAColor
-    public let lineCount: Int
-
-    public init(
-        fontSize: CGFloat,
-        foregroundColor: RGBAColor,
-        backgroundColor: RGBAColor,
-        lineCount: Int
-    ) {
-        self.fontSize = fontSize
-        self.foregroundColor = foregroundColor
-        self.backgroundColor = backgroundColor
-        self.lineCount = max(1, lineCount)
-    }
-
-    public static let fallback = ImageTranslationAppearance(
-        fontSize: 14,
-        foregroundColor: .black,
-        backgroundColor: .white,
-        lineCount: 1
-    )
-}
-
-public struct ImageTranslationBlock: Equatable, Sendable, Identifiable {
-    public let id: UUID
-    public let text: String
-    public let boundingBox: CGRect
-    public let appearance: ImageTranslationAppearance
-
-    public init(
-        id: UUID = UUID(),
-        text: String,
-        boundingBox: CGRect,
-        appearance: ImageTranslationAppearance = .fallback
-    ) {
-        self.id = id
-        self.text = text
-        self.boundingBox = boundingBox
-        self.appearance = appearance
-    }
-}
-
-public enum ImageTranslationTextLayout {
-    /// Screenshot translations favor legibility over strict containment. The
-    /// layout engine first finds a shared fitting size, then rendering applies
-    /// this explicit readability multiplier consistently in preview and export.
-    public static let forcedFontScale: CGFloat = 1.5
-
-    public static func fittedFontSize(
-        for text: String,
-        in rect: CGRect,
-        preferredSize: CGFloat,
-        minimumScale: CGFloat = 0.55
-    ) -> CGFloat {
-        let horizontalPadding = max(2, preferredSize * 0.16)
-        let verticalPadding = max(1, preferredSize * 0.10)
-        let availableWidth = max(1, rect.width - horizontalPadding * 2)
-        let availableHeight = max(1, rect.height - verticalPadding * 2)
-        let font = NSFont.systemFont(ofSize: preferredSize, weight: .regular)
-        let measured = (text as NSString).size(withAttributes: [.font: font])
-        let widthScale = availableWidth / max(1, measured.width)
-        let lineHeight = ceil(font.ascender - font.descender + font.leading)
-        let heightScale = availableHeight / max(1, lineHeight)
-        return preferredSize * min(1, max(minimumScale, min(widthScale, heightScale)))
     }
 }
 
@@ -235,6 +176,14 @@ public struct SupportedLanguage: RawRepresentable, CaseIterable, Codable, Hashab
         return rawValue
     }
 
+    /// Returns true when the two languages are the same concrete language.
+    /// Auto-detection never counts as a match.
+    public func isSameLanguage(as other: SupportedLanguage) -> Bool {
+        guard self != .auto, other != .auto else { return false }
+        if self == other { return true }
+        return rawValue == other.rawValue
+    }
+
     public init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
         let rawValue = try container.decode(String.self)
@@ -250,45 +199,12 @@ public struct SupportedLanguage: RawRepresentable, CaseIterable, Codable, Hashab
     }
 }
 
-public struct LanguagePackManifest: Codable, Equatable, Sendable, Identifiable {
-    public let id: String
-    public let sourceLanguage: SupportedLanguage
-    public let targetLanguage: SupportedLanguage
-    public let version: String
-    public let downloadURL: URL
-    public let compressedBytes: Int64
-    public let sha256: String
-    public let licenseName: String
-    public let attribution: String
-
-    public init(
-        id: String,
-        sourceLanguage: SupportedLanguage,
-        targetLanguage: SupportedLanguage,
-        version: String,
-        downloadURL: URL,
-        compressedBytes: Int64,
-        sha256: String,
-        licenseName: String,
-        attribution: String
-    ) {
-        self.id = id
-        self.sourceLanguage = sourceLanguage
-        self.targetLanguage = targetLanguage
-        self.version = version
-        self.downloadURL = downloadURL
-        self.compressedBytes = compressedBytes
-        self.sha256 = sha256
-        self.licenseName = licenseName
-        self.attribution = attribution
-    }
-}
-
 public enum HelloXError: LocalizedError, Equatable, Sendable {
     case screenRecordingPermissionDenied
     case accessibilityPermissionDenied
     case captureFailed(String)
     case cancelled
+    case scrollNotAccepted(String)
     case noTextFound
     case invalidConfiguration(String)
     case authenticationFailed
@@ -296,7 +212,6 @@ public enum HelloXError: LocalizedError, Equatable, Sendable {
     case network(String)
     case invalidResponse
     case languageNotSupported
-    case insufficientDiskSpace(Int64)
 
     public var errorDescription: String? {
         switch self {
@@ -304,6 +219,7 @@ public enum HelloXError: LocalizedError, Equatable, Sendable {
         case .accessibilityPermissionDenied: "滚动长截图需要辅助功能权限。"
         case .captureFailed(let message): "截图失败：\(message)"
         case .cancelled: "操作已取消。"
+        case .scrollNotAccepted(let message): "滚动未生效：\(message)"
         case .noTextFound: "图片中没有识别到文字。"
         case .invalidConfiguration(let message): "配置无效：\(message)"
         case .authenticationFailed: "API Key 无效或没有访问权限。"
@@ -311,7 +227,6 @@ public enum HelloXError: LocalizedError, Equatable, Sendable {
         case .network(let message): "网络请求失败：\(message)"
         case .invalidResponse: "服务返回了无法解析的数据。"
         case .languageNotSupported: "不支持所选语言组合。"
-        case .insufficientDiskSpace(let bytes): "磁盘空间不足，至少需要 \(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)) 可用空间。"
         }
     }
 }

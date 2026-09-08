@@ -7,8 +7,23 @@ import Darwin
 public protocol ScreenCapturing: Sendable {
     func captureRegion(_ rect: CGRect) async throws -> CaptureResult
     func captureRegion(_ rect: CGRect, excludingOwnWindows: Bool) async throws -> CaptureResult
+    func prepareRegionCapture(
+        _ rect: CGRect,
+        excludingOwnWindows: Bool
+    ) async throws -> any RegionFrameCapturing
     func captureDisplay(containing point: CGPoint?) async throws -> CaptureResult
     func captureWindow(at point: CGPoint?) async throws -> CaptureResult
+}
+
+public protocol RegionFrameCapturing: Sendable {
+    func capture() async throws -> CaptureResult
+}
+
+struct PixelAlignedCaptureRegion: Sendable, Equatable {
+    let sourceRect: CGRect
+    let capturedRect: CGRect
+    let pixelWidth: Int
+    let pixelHeight: Int
 }
 
 public extension ScreenCapturing {
@@ -17,6 +32,36 @@ public extension ScreenCapturing {
     func captureRegion(_ rect: CGRect, excludingOwnWindows: Bool) async throws -> CaptureResult {
         try await captureRegion(rect)
     }
+
+    /// Test and custom capturers keep their existing implementation. The
+    /// ScreenCaptureKit capturer overrides this to reuse one prepared filter
+    /// throughout a scrolling session.
+    func prepareRegionCapture(
+        _ rect: CGRect,
+        excludingOwnWindows: Bool
+    ) async throws -> any RegionFrameCapturing {
+        PassthroughRegionFrameCapturer(
+            capturer: self,
+            rect: rect,
+            excludingOwnWindows: excludingOwnWindows
+        )
+    }
+}
+
+private actor PassthroughRegionFrameCapturer: RegionFrameCapturing {
+    private let capturer: any ScreenCapturing
+    private let rect: CGRect
+    private let excludingOwnWindows: Bool
+
+    init(capturer: any ScreenCapturing, rect: CGRect, excludingOwnWindows: Bool) {
+        self.capturer = capturer
+        self.rect = rect
+        self.excludingOwnWindows = excludingOwnWindows
+    }
+
+    func capture() async throws -> CaptureResult {
+        try await capturer.captureRegion(rect, excludingOwnWindows: excludingOwnWindows)
+    }
 }
 
 public final class ScreenCaptureService: NSObject, ScreenCapturing, @unchecked Sendable {
@@ -24,6 +69,56 @@ public final class ScreenCaptureService: NSObject, ScreenCapturing, @unchecked S
 
     public override init() {
         super.init()
+    }
+
+    /// Captures the visible WindowServer composition without yielding to the
+    /// run loop. Global hot-key handlers use this before returning so transient
+    /// windows (notably context menus) cannot disappear before the frame is
+    /// frozen.
+    public func captureVisibleDisplaysImmediately(
+        excludingOwnApplication: Bool = false
+    ) -> [CaptureResult] {
+        guard CGPreflightScreenCaptureAccess() else { return [] }
+
+        var displayCount: UInt32 = 0
+        guard CGGetActiveDisplayList(0, nil, &displayCount) == .success,
+              displayCount > 0 else { return [] }
+        var displayIDs = [CGDirectDisplayID](repeating: 0, count: Int(displayCount))
+        guard CGGetActiveDisplayList(displayCount, &displayIDs, &displayCount) == .success else {
+            return []
+        }
+
+        return displayIDs.compactMap { displayID in
+            let frame = CGDisplayBounds(displayID)
+            guard frame.width > 0, frame.height > 0 else { return nil }
+            let image: CGImage?
+            if excludingOwnApplication {
+                image = legacyDisplayComposite(
+                    displayFrame: frame,
+                    listOptions: .optionOnScreenOnly,
+                    imageOptions: [.bestResolution, .boundsIgnoreFraming],
+                    excludingProcessID: ProcessInfo.processInfo.processIdentifier
+                )
+            } else {
+                image = legacyDisplayComposite(
+                    displayFrame: frame,
+                    listOptions: .optionOnScreenOnly,
+                    imageOptions: [.bestResolution, .boundsIgnoreFraming]
+                )
+            }
+            guard let image else { return nil }
+            let normalizedImage = normalizedToSRGB(image)
+            return CaptureResult(
+                image: normalizedImage,
+                displayScale: Self.resolvedDisplayScale(
+                    backingScale: 1,
+                    imageWidth: normalizedImage.width,
+                    frameWidth: frame.width
+                ),
+                capturedRect: frame,
+                mode: .fullScreen
+            )
+        }
     }
 
     public func captureRegion(_ rect: CGRect) async throws -> CaptureResult {
@@ -48,18 +143,19 @@ public final class ScreenCaptureService: NSObject, ScreenCapturing, @unchecked S
 
         let displayFrame = CGRect(x: display.frame.origin.x, y: display.frame.origin.y,
                                   width: display.frame.width, height: display.frame.height)
-        let clipped = rect.intersection(displayFrame)
-        guard !clipped.isNull, clipped.width >= 1, clipped.height >= 1 else {
+        let backingScale = displayScale(for: display)
+        guard let alignedRegion = Self.pixelAlignedRegion(
+            rect,
+            displayFrame: displayFrame,
+            scale: backingScale
+        ) else {
             throw HelloXError.captureFailed("截图区域无效")
         }
-        let localRect = CGRect(
-            x: clipped.minX - displayFrame.minX,
-            y: clipped.minY - displayFrame.minY,
-            width: clipped.width,
-            height: clipped.height
+        let configuration = makeConfiguration(
+            sourceRect: alignedRegion.sourceRect,
+            pixelWidth: alignedRegion.pixelWidth,
+            pixelHeight: alignedRegion.pixelHeight
         )
-        let scale = displayScale(for: display)
-        let configuration = makeConfiguration(sourceRect: localRect, scale: scale)
 
         let excludedWindows: [SCWindow]
         if excludingOwnWindows {
@@ -74,7 +170,74 @@ public final class ScreenCaptureService: NSObject, ScreenCapturing, @unchecked S
             excludingWindows: excludedWindows
         )
         let image = try await capture(filter: filter, configuration: configuration)
-        return CaptureResult(image: image, displayScale: scale, capturedRect: clipped, mode: .region)
+        let scale = Self.resolvedDisplayScale(
+            backingScale: backingScale,
+            imageWidth: image.width,
+            frameWidth: alignedRegion.capturedRect.width
+        )
+        return CaptureResult(
+            image: image,
+            displayScale: scale,
+            capturedRect: alignedRegion.capturedRect,
+            mode: .region
+        )
+    }
+
+    public func prepareRegionCapture(
+        _ rect: CGRect,
+        excludingOwnWindows: Bool
+    ) async throws -> any RegionFrameCapturing {
+        guard CGPreflightScreenCaptureAccess() else {
+            throw HelloXError.screenRecordingPermissionDenied
+        }
+
+        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        guard let display = content.displays.first(where: { display in
+            CGRect(
+                x: display.frame.origin.x,
+                y: display.frame.origin.y,
+                width: display.frame.width,
+                height: display.frame.height
+            ).intersects(rect)
+        }) else {
+            throw HelloXError.captureFailed("找不到选区所在的显示器")
+        }
+
+        let displayFrame = CGRect(
+            x: display.frame.origin.x,
+            y: display.frame.origin.y,
+            width: display.frame.width,
+            height: display.frame.height
+        )
+        let backingScale = displayScale(for: display)
+        guard let alignedRegion = Self.pixelAlignedRegion(
+            rect,
+            displayFrame: displayFrame,
+            scale: backingScale
+        ) else {
+            throw HelloXError.captureFailed("截图区域无效")
+        }
+        let configuration = makeConfiguration(
+            sourceRect: alignedRegion.sourceRect,
+            pixelWidth: alignedRegion.pixelWidth,
+            pixelHeight: alignedRegion.pixelHeight
+        )
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        let excludedWindows = excludingOwnWindows
+            ? content.windows.filter { $0.owningApplication?.processID == ownPID }
+            : []
+        let filter = SCContentFilter(display: display, excludingWindows: excludedWindows)
+        let resolvedScale = Self.resolvedDisplayScale(
+            backingScale: backingScale,
+            imageWidth: alignedRegion.pixelWidth,
+            frameWidth: alignedRegion.capturedRect.width
+        )
+        return ScreenCaptureKitRegionFrameCapturer(
+            filter: filter,
+            configuration: configuration,
+            displayScale: resolvedScale,
+            capturedRect: alignedRegion.capturedRect
+        )
     }
 
 
@@ -112,9 +275,11 @@ public final class ScreenCaptureService: NSObject, ScreenCapturing, @unchecked S
                 fallbackConfiguration: configuration
             )
         }
-        let actualScale = display.frame.width > 0
-            ? CGFloat(image.width) / display.frame.width
-            : scale
+        let actualScale = Self.resolvedDisplayScale(
+            backingScale: scale,
+            imageWidth: image.width,
+            frameWidth: display.frame.width
+        )
         return CaptureResult(image: image, displayScale: actualScale, capturedRect: display.frame, mode: .fullScreen)
     }
 
@@ -129,16 +294,40 @@ public final class ScreenCaptureService: NSObject, ScreenCapturing, @unchecked S
         let targetPoint = point ?? coreGraphicsPoint(fromAppKit: NSEvent.mouseLocation)
         let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
         let ownPID = ProcessInfo.processInfo.processIdentifier
-        let candidates = content.windows.filter { window in
-            (!excludingOwnApplication || window.owningApplication?.processID != ownPID) &&
-            window.frame.contains(targetPoint) &&
-            window.frame.width > 40 && window.frame.height > 40
+        let candidates = content.windows.enumerated().compactMap { index, window -> (index: Int, window: SCWindow)? in
+            guard (!excludingOwnApplication || window.owningApplication?.processID != ownPID),
+                  window.isOnScreen,
+                  window.windowLayer >= 0,
+                  window.frame.contains(targetPoint),
+                  window.frame.width > 40,
+                  window.frame.height > 40 else {
+                return nil
+            }
+            return (index, window)
         }
-        guard let window = candidates.min(by: { lhs, rhs in
-            lhs.frame.width * lhs.frame.height < rhs.frame.width * rhs.frame.height
-        }) ?? content.windows.first(where: {
-            !excludingOwnApplication || $0.owningApplication?.processID != ownPID
-        }) else {
+
+        // SCShareableContent can expose several windows for one app (for
+        // example a title-bar/content child window and the actual app window).
+        // Picking the smallest rectangle can therefore drop the top or bottom
+        // of the visible window. Prefer the active/front layer first, then the
+        // larger containing window so the full frame is retained.
+        guard let window = (candidates.sorted(by: { lhs, rhs in
+            if lhs.window.isActive != rhs.window.isActive {
+                return lhs.window.isActive && !rhs.window.isActive
+            }
+            if lhs.window.windowLayer != rhs.window.windowLayer {
+                return lhs.window.windowLayer < rhs.window.windowLayer
+            }
+            let lhsArea = lhs.window.frame.width * lhs.window.frame.height
+            let rhsArea = rhs.window.frame.width * rhs.window.frame.height
+            if lhsArea != rhsArea { return lhsArea > rhsArea }
+            // Keep ScreenCaptureKit's original ordering as the final tie
+            // breaker; it is the compositor's front-to-back order.
+            return lhs.index < rhs.index
+        }).first?.window ?? content.windows.first(where: {
+            (!excludingOwnApplication || $0.owningApplication?.processID != ownPID) &&
+            $0.isOnScreen && $0.frame.width > 40 && $0.frame.height > 40
+        })) else {
             throw HelloXError.captureFailed("鼠标位置没有可截图的窗口")
         }
         let targetDisplay = content.displays.max { lhs, rhs in
@@ -151,14 +340,22 @@ public final class ScreenCaptureService: NSObject, ScreenCapturing, @unchecked S
             ?? NSScreen.screens.first(where: { $0.frame.intersects(window.frame) })?.backingScaleFactor
             ?? 1
         let configuration = SCStreamConfiguration()
-        configuration.width = max(1, Int(window.frame.width * scale))
-        configuration.height = max(1, Int(window.frame.height * scale))
+        configuration.width = max(1, Int(ceil(window.frame.width * scale)))
+        configuration.height = max(1, Int(ceil(window.frame.height * scale)))
         configuration.showsCursor = false
         configuration.capturesAudio = false
         Self.configureSDRColorOutput(configuration)
         let filter = SCContentFilter(desktopIndependentWindow: window)
         let image = try await capture(filter: filter, configuration: configuration)
-        return CaptureResult(image: image, displayScale: scale, capturedRect: window.frame, mode: .window)
+        // Recompute the scale from the actual image pixels: ScreenCaptureKit may
+        // return a different resolution than frame * backingScale, and a stale
+        // scale would stretch the image in the editor and misalign annotations.
+        let actualScale = Self.resolvedDisplayScale(
+            backingScale: scale,
+            imageWidth: image.width,
+            frameWidth: window.frame.width
+        )
+        return CaptureResult(image: image, displayScale: actualScale, capturedRect: window.frame, mode: .window)
     }
 
     private func ownApplications(in content: SCShareableContent) -> [SCRunningApplication] {
@@ -168,16 +365,70 @@ public final class ScreenCaptureService: NSObject, ScreenCapturing, @unchecked S
     }
 
     private func makeConfiguration(sourceRect: CGRect, scale: CGFloat) -> SCStreamConfiguration {
+        let pixelWidth = max(1, Int((sourceRect.width * scale).rounded()))
+        let pixelHeight = max(1, Int((sourceRect.height * scale).rounded()))
+        return makeConfiguration(
+            sourceRect: sourceRect,
+            pixelWidth: pixelWidth,
+            pixelHeight: pixelHeight
+        )
+    }
+
+    private func makeConfiguration(
+        sourceRect: CGRect,
+        pixelWidth: Int,
+        pixelHeight: Int
+    ) -> SCStreamConfiguration {
         let configuration = SCStreamConfiguration()
         configuration.sourceRect = sourceRect
-        configuration.width = max(1, Int(sourceRect.width * scale))
-        configuration.height = max(1, Int(sourceRect.height * scale))
+        configuration.width = max(1, pixelWidth)
+        configuration.height = max(1, pixelHeight)
         configuration.minimumFrameInterval = CMTime(value: 1, timescale: 60)
         configuration.queueDepth = 1
         configuration.showsCursor = false
         configuration.capturesAudio = false
         Self.configureSDRColorOutput(configuration)
         return configuration
+    }
+
+    /// Snaps a global point-space selection outward to the display's physical
+    /// pixel grid. ScreenCaptureKit otherwise resamples fractional source
+    /// bounds into a separately rounded output size, softening every edge in
+    /// the captured frame.
+    static func pixelAlignedRegion(
+        _ rect: CGRect,
+        displayFrame: CGRect,
+        scale: CGFloat
+    ) -> PixelAlignedCaptureRegion? {
+        guard scale.isFinite, scale >= 1,
+              displayFrame.width > 0, displayFrame.height > 0 else { return nil }
+        let clipped = rect.intersection(displayFrame)
+        guard !clipped.isNull, clipped.width >= 1, clipped.height >= 1 else { return nil }
+
+        let local = CGRect(
+            x: clipped.minX - displayFrame.minX,
+            y: clipped.minY - displayFrame.minY,
+            width: clipped.width,
+            height: clipped.height
+        )
+        let localDisplay = CGRect(origin: .zero, size: displayFrame.size)
+        let aligned = CGRect(
+            x: floor(local.minX * scale) / scale,
+            y: floor(local.minY * scale) / scale,
+            width: ceil(local.maxX * scale) / scale - floor(local.minX * scale) / scale,
+            height: ceil(local.maxY * scale) / scale - floor(local.minY * scale) / scale
+        ).intersection(localDisplay)
+        guard !aligned.isNull, aligned.width >= 1, aligned.height >= 1 else { return nil }
+
+        let pixelWidth = Int((aligned.width * scale).rounded())
+        let pixelHeight = Int((aligned.height * scale).rounded())
+        guard pixelWidth >= 1, pixelHeight >= 1 else { return nil }
+        return PixelAlignedCaptureRegion(
+            sourceRect: aligned,
+            capturedRect: aligned.offsetBy(dx: displayFrame.minX, dy: displayFrame.minY),
+            pixelWidth: pixelWidth,
+            pixelHeight: pixelHeight
+        )
     }
 
     private func capture(filter: SCContentFilter, configuration: SCStreamConfiguration) async throws -> CGImage {
@@ -209,6 +460,11 @@ public final class ScreenCaptureService: NSObject, ScreenCapturing, @unchecked S
         fallbackFilter: SCContentFilter,
         fallbackConfiguration: SCStreamConfiguration
     ) async throws -> CGImage {
+        // ScreenCaptureKit does not reliably composite transient windows such
+        // as context menus. Capture the visible WindowServer composition first
+        // so the frozen frame retains exactly what was on screen when the
+        // shortcut fired. Keep ScreenCaptureKit as the compatibility fallback
+        // when the legacy compositor is unavailable.
         if let image = legacyDisplayComposite(
             displayFrame: displayFrame,
             listOptions: .optionOnScreenOnly,
@@ -222,8 +478,17 @@ public final class ScreenCaptureService: NSObject, ScreenCapturing, @unchecked S
     private func legacyDisplayComposite(
         displayFrame: CGRect,
         listOptions: CGWindowListOption,
-        imageOptions: CGWindowImageOption
+        imageOptions: CGWindowImageOption,
+        excludingProcessID: pid_t? = nil
     ) -> CGImage? {
+        if let excludingProcessID {
+            return legacyDisplayComposite(
+                displayFrame: displayFrame,
+                listOptions: listOptions,
+                imageOptions: imageOptions,
+                excludingProcessID: excludingProcessID
+            )
+        }
         typealias CreateImage = @convention(c) (
             CGRect,
             CGWindowListOption,
@@ -236,8 +501,45 @@ public final class ScreenCaptureService: NSObject, ScreenCapturing, @unchecked S
         ), let symbol = dlsym(handle, "CGWindowListCreateImage") else {
             return nil
         }
+        defer { dlclose(handle) }
         let createImage = unsafeBitCast(symbol, to: CreateImage.self)
         return createImage(displayFrame, listOptions, kCGNullWindowID, imageOptions)
+    }
+
+    private func legacyDisplayComposite(
+        displayFrame: CGRect,
+        listOptions: CGWindowListOption,
+        imageOptions: CGWindowImageOption,
+        excludingProcessID: pid_t
+    ) -> CGImage? {
+        guard let windowInfo = CGWindowListCopyWindowInfo(
+            listOptions,
+            kCGNullWindowID
+        ) as? [[String: Any]] else { return nil }
+        let windowIDs = windowInfo.compactMap { info -> NSNumber? in
+            guard (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value
+                    != excludingProcessID,
+                  let windowID = info[kCGWindowNumber as String] as? NSNumber else {
+                return nil
+            }
+            return windowID
+        }
+        guard !windowIDs.isEmpty else { return nil }
+
+        typealias CreateImageFromArray = @convention(c) (
+            CGRect,
+            CFArray,
+            CGWindowImageOption
+        ) -> CGImage?
+        guard let handle = dlopen(
+            "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics",
+            RTLD_LAZY
+        ), let symbol = dlsym(handle, "CGWindowListCreateImageFromArray") else {
+            return nil
+        }
+        defer { dlclose(handle) }
+        let createImage = unsafeBitCast(symbol, to: CreateImageFromArray.self)
+        return createImage(displayFrame, windowIDs as CFArray, imageOptions)
     }
 
     static func configureSDRColorOutput(_ configuration: SCStreamConfiguration) {
@@ -289,6 +591,21 @@ public final class ScreenCaptureService: NSObject, ScreenCapturing, @unchecked S
         return 1
     }
 
+    /// Resolves the scale used to interpret a captured image. Prefers the
+    /// actual pixel-to-point ratio of the returned image, falling back to the
+    /// display's backing scale so mixed-resolution captures stay aligned with
+    /// the editor's annotation coordinates.
+    static func resolvedDisplayScale(
+        backingScale: CGFloat,
+        imageWidth: Int,
+        frameWidth: CGFloat
+    ) -> CGFloat {
+        let actual = frameWidth > 0 ? CGFloat(imageWidth) / frameWidth : 0
+        if actual.isFinite, actual >= 1 { return actual }
+        if backingScale.isFinite, backingScale >= 1 { return backingScale }
+        return 1
+    }
+
     private func coreGraphicsPoint(fromAppKit point: CGPoint) -> CGPoint {
         let appKitBounds = CoordinateMapper.union(NSScreen.screens.map(\.frame))
         let coreGraphicsBounds = coreGraphicsDesktopBounds()
@@ -305,6 +622,52 @@ public final class ScreenCaptureService: NSObject, ScreenCapturing, @unchecked S
             return CoordinateMapper.union(NSScreen.screens.map(\.frame))
         }
         return CoordinateMapper.union(displays.map(CGDisplayBounds))
+    }
+}
+
+private final class ScreenCaptureKitRegionFrameCapturer: RegionFrameCapturing, @unchecked Sendable {
+    private let filter: SCContentFilter
+    private let configuration: SCStreamConfiguration
+    private let displayScale: CGFloat
+    private let capturedRect: CGRect
+    private let ciContext = CIContext(options: [.cacheIntermediates: false])
+
+    init(
+        filter: SCContentFilter,
+        configuration: SCStreamConfiguration,
+        displayScale: CGFloat,
+        capturedRect: CGRect
+    ) {
+        self.filter = filter
+        self.configuration = configuration
+        self.displayScale = displayScale
+        self.capturedRect = capturedRect
+    }
+
+    func capture() async throws -> CaptureResult {
+        let source = try await SCScreenshotManager.captureImage(
+            contentFilter: filter,
+            configuration: configuration
+        )
+        let image: CGImage
+        if source.colorSpace?.name != CGColorSpace.sRGB,
+           let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) {
+            let input = CIImage(cgImage: source)
+            image = ciContext.createCGImage(
+                input,
+                from: input.extent,
+                format: .BGRA8,
+                colorSpace: colorSpace
+            ) ?? source
+        } else {
+            image = source
+        }
+        return CaptureResult(
+            image: image,
+            displayScale: displayScale,
+            capturedRect: capturedRect,
+            mode: .region
+        )
     }
 }
 

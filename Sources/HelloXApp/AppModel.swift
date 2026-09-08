@@ -53,15 +53,19 @@ final class AppModel: ObservableObject {
     let capturer = ScreenCaptureService()
     let ocrService = VisionOCRService()
     let selectionService = SystemTextSelectionService()
+    let dynamicIslandPreferences = DynamicIslandPreferencesStore()
+    lazy var menuBarOverflowService = MenuBarOverflowService()
 
     @Published var lastError: String?
     @Published var isBusy = false
+    @Published private(set) var isDynamicIslandSuppressed = false
     @Published var isShowingSettings = false
     @Published var selectedMode: CaptureMode = .region
-    @Published var mainDestination: SettingsDestination = .workbench
+    @Published var mainDestination: SettingsDestination = .shortcuts
     @Published var translationProfiles: [TranslationProfile] = []
     @Published var defaultTranslationProfileID: UUID?
     @Published var isOfflineTranslationEnabled = true
+    @Published private(set) var screenshotTranslationTargetLanguage: SupportedLanguage = .simplifiedChinese
     private var translationAPIKeys: [String: String] = [:]
     @Published var shortcutBindings = ShortcutPreferences.load()
     @Published var shortcutValidationMessage: String?
@@ -79,22 +83,41 @@ final class AppModel: ObservableObject {
     private var ocrResultWindow: OCRResultWindowController?
     private var qrCodeResultWindow: QRCodeResultWindowController?
     private var translationWindow: TranslationWindowController?
+    private var selectionTranslationTask: Task<Void, Never>?
+    private var selectionTranslationRequestID: UUID?
     private var captureSessionActive = false
+    private var activeCaptureSuppressesDynamicIsland = false
+    private var pendingCaptureSuppressesDynamicIsland = false
     private var lastExternalApplicationPID: pid_t?
     private var activationObserver: NSObjectProtocol?
     private var permissionActivationObserver: NSObjectProtocol?
-    private var promptedSemanticSelectionAccessibility = false
+    private let pendingPermissionStore = PendingPermissionActionStore()
+    private var pendingPermissionAction: PendingPermissionAction?
+    private var permissionRequestInFlight = false
+    private var awaitingPermissionReturn = false
+    private var requestedPermission: PrivacyPermission?
     var shortcutApplyHandler: (([ShortcutAction: ShortcutBinding]) -> Result<Void, ShortcutRegistrationError>)?
     var shortcutAvailabilityHandler: ((ShortcutAction, ShortcutBinding) -> ShortcutRegistrationError?)?
     private let updateClient = GitHubReleaseClient()
+    private static let screenshotTranslationTargetLanguageKey = "screenshot-translation-target-language"
 
-    init() {
-        let profileState = TranslationProfilePreferences.loadOrMigrate(legacyKeychain: KeychainStore())
+    /// Supplying a state creates an isolated model for rendered previews and
+    /// layout checks, without loading credentials or resuming permission work.
+    init(translationProfileState: TranslationProfileState? = nil) {
+        if let rawValue = UserDefaults.standard.string(forKey: Self.screenshotTranslationTargetLanguageKey),
+           let language = SupportedLanguage(rawValue: rawValue),
+           language != .auto {
+            screenshotTranslationTargetLanguage = language
+        }
+        let profileState = translationProfileState
+            ?? TranslationProfilePreferences.loadOrMigrate(legacyKeychain: KeychainStore())
         translationProfiles = profileState.profiles
         defaultTranslationProfileID = profileState.defaultProfileID
         isOfflineTranslationEnabled = profileState.isOfflineTranslationEnabled
         translationAPIKeys = profileState.apiKeys
         normalizeDefaultTranslationProfile()
+        if translationProfileState != nil { return }
+        pendingPermissionAction = pendingPermissionStore.load()
         let ownPID = ProcessInfo.processInfo.processIdentifier
         if let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier, pid != ownPID {
             lastExternalApplicationPID = pid
@@ -113,44 +136,84 @@ final class AppModel: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in self?.permissions.refresh(returnedFromSettings: true) }
+            Task { @MainActor in
+                guard let self else { return }
+                self.permissions.refresh(returnedFromSettings: true)
+                self.resumePendingPermissionAction()
+            }
         }
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 700_000_000)
-            self?.presentOnboardingIfNeeded()
+            self?.resumePendingPermissionAction(afterLaunch: true)
         }
     }
 
     func startCapture(_ mode: CaptureMode) {
-        guard beginCaptureSession() else { return }
+        startCapture(mode, hideDynamicIsland: false, initialDisplayCaptures: [])
+    }
+
+    func startCapture(
+        _ mode: CaptureMode,
+        hideDynamicIsland: Bool,
+        initialDisplayCaptures: [CaptureResult] = []
+    ) {
+        authorizeAndPerform(
+            .capture(mode: mode, targetProcessID: targetApplicationPID().map { Int32($0) }),
+            hideDynamicIslandDuringCapture: hideDynamicIsland,
+            initialDisplayCaptures: initialDisplayCaptures
+        )
+    }
+
+    private func performCapture(
+        _ mode: CaptureMode,
+        targetProcessID: Int32?,
+        hideDynamicIsland: Bool,
+        initialDisplayCaptures: [CaptureResult]
+    ) {
+        guard beginCaptureSession(hideDynamicIsland: hideDynamicIsland) else { return }
         selectedMode = mode
         lastError = nil
-        permissions.refresh()
-        guard permissions.canRecordScreen else {
-            endCaptureSession()
-            presentScreenPermissionRecovery()
-            return
-        }
-        let scrollProcessID = targetApplicationPID()
+        let scrollProcessID = targetProcessID.map { pid_t($0) }
         Task { @MainActor in
             defer { endCaptureSession() }
             do {
                 let result: CaptureResult
                 switch mode {
                 case .region, .scrolling:
-                    let selectedDisplay = try await selectRegionAcrossDisplays()
+                    let selectedDisplay = try await selectRegionAcrossDisplays(
+                        initialResults: initialDisplayCaptures
+                    )
+                    var refinedSelection = selectedDisplay.selection
+                    var detectedRegions: [ScrollableRegion] = []
+                    if mode == .scrolling, let targetPID = scrollProcessID {
+                        detectedRegions = ScrollableRegionDetector.detect(processID: targetPID)
+                        if let best = Self.bestScrollableRegion(
+                            for: refinedSelection,
+                            in: detectedRegions
+                        ) {
+                            refinedSelection = best.bounds
+                        }
+                    }
                     showCaptureOverlay(
                         for: selectedDisplay.result,
                         imageFrame: selectedDisplay.frame,
-                        selection: selectedDisplay.selection,
+                        selection: refinedSelection,
                         startsScrolling: mode == .scrolling,
-                        scrollProcessID: scrollProcessID
+                        scrollProcessID: scrollProcessID,
+                        detectedScrollableRegions: detectedRegions
                     )
                     return
                 case .window:
                     result = try await capturer.captureWindow(excludingOwnApplication: false)
                 case .fullScreen:
-                    result = try await capturer.captureDisplay(excludingOwnApplication: false)
+                    let triggerPoint = coreGraphicsPoint(fromAppKit: NSEvent.mouseLocation)
+                    if let initialCapture = initialDisplayCaptures.first(where: {
+                        $0.capturedRect.contains(triggerPoint)
+                    }) {
+                        result = initialCapture
+                    } else {
+                        result = try await capturer.captureDisplay(excludingOwnApplication: false)
+                    }
                 }
                 let frame = appKitRect(fromCoreGraphics: result.capturedRect)
                 showCaptureOverlay(
@@ -169,18 +232,23 @@ final class AppModel: ObservableObject {
     }
 
     func startScreenRecording() {
+        startScreenRecording(hideDynamicIsland: false)
+    }
+
+    func startScreenRecording(hideDynamicIsland: Bool) {
+        authorizeAndPerform(
+            .screenRecording,
+            hideDynamicIslandDuringCapture: hideDynamicIsland
+        )
+    }
+
+    private func performScreenRecording(hideDynamicIsland: Bool) {
         guard recordingController == nil else {
             NSSound.beep()
             return
         }
-        guard beginCaptureSession() else { return }
+        guard beginCaptureSession(hideDynamicIsland: hideDynamicIsland) else { return }
         lastError = nil
-        permissions.refresh()
-        guard permissions.canRecordScreen else {
-            endCaptureSession()
-            presentScreenPermissionRecovery()
-            return
-        }
 
         Task { @MainActor [weak self] in
             guard let self else { return }
@@ -197,6 +265,7 @@ final class AppModel: ObservableObject {
                     outputURL: outputURL
                 )
                 recordingController = controller
+                updateDynamicIslandSuppression()
                 recorder.onUnexpectedStop = { [weak self] error in
                     Task { @MainActor in
                         self?.recordingController?.failBecauseStreamStopped(error)
@@ -205,12 +274,16 @@ final class AppModel: ObservableObject {
                 controller.onFinish = { [weak self] url in
                     guard let self else { return }
                     recordingController = nil
+                    activeCaptureSuppressesDynamicIsland = false
+                    updateDynamicIslandSuppression()
                     lastError = nil
                     CopyFeedbackPresenter.shared.showSuccess("录屏已保存：\(url.lastPathComponent)")
                 }
                 controller.onFailure = { [weak self] error in
                     guard let self else { return }
                     recordingController = nil
+                    activeCaptureSuppressesDynamicIsland = false
+                    updateDynamicIslandSuppression()
                     let message = error.localizedDescription
                     lastError = message
                     CopyFeedbackPresenter.shared.showFailure(message)
@@ -218,11 +291,14 @@ final class AppModel: ObservableObject {
                 }
                 controller.onCancel = { [weak self] in
                     self?.recordingController = nil
+                    self?.activeCaptureSuppressesDynamicIsland = false
+                    self?.updateDynamicIslandSuppression()
                 }
                 controller.present()
                 endCaptureSession()
             } catch {
                 recordingController = nil
+                updateDynamicIslandSuppression()
                 endCaptureSession()
                 if !(error is CancellationError), (error as? HelloXError) != .cancelled {
                     handleCaptureError(error)
@@ -294,26 +370,48 @@ final class AppModel: ObservableObject {
     }
 
     func captureAndOCR() {
-        captureTextFromScreen(runTranslation: false)
+        captureAndOCR(hideDynamicIsland: false, initialDisplayCaptures: [])
+    }
+
+    func captureAndOCR(
+        hideDynamicIsland: Bool,
+        initialDisplayCaptures: [CaptureResult] = []
+    ) {
+        authorizeAndPerform(
+            .captureAndOCR,
+            hideDynamicIslandDuringCapture: hideDynamicIsland,
+            initialDisplayCaptures: initialDisplayCaptures
+        )
     }
 
     func captureAndTranslate() {
-        captureTextFromScreen(runTranslation: true)
+        captureAndTranslate(hideDynamicIsland: false, initialDisplayCaptures: [])
     }
 
-    private func captureTextFromScreen(runTranslation: Bool) {
-        guard beginCaptureSession() else { return }
+    func captureAndTranslate(
+        hideDynamicIsland: Bool,
+        initialDisplayCaptures: [CaptureResult] = []
+    ) {
+        authorizeAndPerform(
+            .captureAndTranslate,
+            hideDynamicIslandDuringCapture: hideDynamicIsland,
+            initialDisplayCaptures: initialDisplayCaptures
+        )
+    }
+
+    private func captureTextFromScreen(
+        runTranslation: Bool = false,
+        hideDynamicIsland: Bool,
+        initialDisplayCaptures: [CaptureResult]
+    ) {
+        guard beginCaptureSession(hideDynamicIsland: hideDynamicIsland) else { return }
         lastError = nil
-        permissions.refresh()
-        guard permissions.canRecordScreen else {
-            endCaptureSession()
-            presentScreenPermissionRecovery()
-            return
-        }
         Task { @MainActor in
             defer { endCaptureSession() }
             do {
-                let selectedDisplay = try await selectRegionAcrossDisplays()
+                let selectedDisplay = try await selectRegionAcrossDisplays(
+                    initialResults: initialDisplayCaptures
+                )
                 showCaptureOverlay(
                     for: selectedDisplay.result,
                     imageFrame: selectedDisplay.frame,
@@ -329,31 +427,36 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func beginCaptureSession() -> Bool {
+    private func beginCaptureSession(hideDynamicIsland: Bool) -> Bool {
         guard !captureSessionActive, selectionController == nil, captureOverlays.isEmpty else {
             NSSound.beep()
             return false
         }
+        activeCaptureSuppressesDynamicIsland = hideDynamicIsland
         captureSessionActive = true
         isBusy = true
+        updateDynamicIslandSuppression()
         return true
     }
 
     private func endCaptureSession() {
         captureSessionActive = false
         isBusy = false
+        if recordingController == nil, captureOverlays.isEmpty {
+            activeCaptureSuppressesDynamicIsland = false
+        }
+        updateDynamicIslandSuppression()
+    }
+
+    private func updateDynamicIslandSuppression() {
+        isDynamicIslandSuppressed = activeCaptureSuppressesDynamicIsland
+            && (captureSessionActive || recordingController != nil || !captureOverlays.isEmpty)
     }
 
     func translateSelectedText() {
         lastError = nil
-        guard let processID = targetApplicationPID() else {
-            presentSelectionTranslationError(
-                SelectedTextError.targetUnavailable,
-                processID: nil
-            )
-            return
-        }
-        translateSelectedText(from: processID)
+        guard let processID = targetApplicationPID() else { return }
+        authorizeAndPerform(.translateSelection(processID: Int32(processID)))
     }
 
     func showTextTranslation() {
@@ -361,8 +464,22 @@ final class AppModel: ObservableObject {
         showTranslation(.manual)
     }
 
+    func showTranslation(_ context: TranslationWindowContext) {
+        lastError = nil
+        showTranslationWindow(context)
+    }
+
     private func translateSelectedText(from processID: pid_t) {
-        Task { @MainActor in
+        selectionTranslationTask?.cancel()
+        let requestID = UUID()
+        selectionTranslationRequestID = requestID
+        selectionTranslationTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                if self.selectionTranslationRequestID == requestID {
+                    self.selectionTranslationTask = nil
+                }
+            }
             do {
                 let context: SelectedTextContext
                 do {
@@ -371,17 +488,22 @@ final class AppModel: ObservableObject {
                         allowClipboardFallback: UserDefaults.standard.bool(forKey: "did-allow-selection-clipboard-fallback")
                     )
                 } catch SelectedTextError.clipboardFallbackRequired {
-                    let alert = NSAlert()
+                    let alert = HelloXAlert()
                     alert.messageText = "允许临时使用剪贴板？"
-                alert.informativeText = "当前应用无法直接提供选中文字。HelloX 可以临时模拟复制，读取文字后恢复原剪贴板内容。"
+                    alert.informativeText = "为准确保留选中文字的段落和换行，HelloX 需要临时模拟复制。读取完成后会恢复原剪贴板内容。"
                     alert.addButton(withTitle: "允许")
                     alert.addButton(withTitle: "取消")
                     guard alert.runModal() == .alertFirstButtonReturn else { return }
                     UserDefaults.standard.set(true, forKey: "did-allow-selection-clipboard-fallback")
                     context = try await selectionService.readSelection(processID: processID, allowClipboardFallback: true)
                 }
+                try Task.checkCancellation()
+                guard selectionTranslationRequestID == requestID,
+                      !SystemTextSelectionService.isClipboardSentinel(context.text) else { return }
                 showSelectionTranslation(context)
             } catch {
+                if error is CancellationError { return }
+                guard selectionTranslationRequestID == requestID else { return }
                 guard !Self.shouldSilentlyIgnoreSelectionTranslationError(error) else { return }
                 presentSelectionTranslationError(error, processID: processID)
             }
@@ -392,24 +514,34 @@ final class AppModel: ObservableObject {
         if case SelectedTextError.noSelection = error {
             return true
         }
+        if case SelectedTextError.targetUnavailable = error {
+            return true
+        }
+        if case SelectedTextError.copyBlocked = error {
+            return true
+        }
         return false
     }
 
     private func presentSelectionTranslationError(_ error: Error, processID: pid_t?) {
         let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         lastError = message
-        let alert = NSAlert()
+        let alert = HelloXAlert()
         alert.alertStyle = .warning
         alert.messageText = "划词翻译不可用"
         alert.informativeText = message
         if case SelectedTextError.accessibilityDenied = error {
             alert.addButton(withTitle: "授权辅助功能")
-            alert.addButton(withTitle: "使用剪贴板兜底")
+            alert.addButton(withTitle: "使用剪贴板保留排版")
             alert.addButton(withTitle: "取消")
             NSApp.activate(ignoringOtherApps: true)
             switch alert.runModal() {
             case .alertFirstButtonReturn:
-                requestAccessibilityPermission()
+                if let processID {
+                    authorizeAndPerform(.translateSelection(processID: Int32(processID)))
+                } else {
+                    requestAccessibilityPermission()
+                }
             case .alertSecondButtonReturn:
                 UserDefaults.standard.set(true, forKey: "did-allow-selection-clipboard-fallback")
                 if let processID { translateSelectedText(from: processID) }
@@ -434,52 +566,209 @@ final class AppModel: ObservableObject {
         showTranslation(.selectedText(context))
     }
 
-    func requestScreenPermission() {
-        guard ensureInstalledForPermissions() else { return }
-        if !permissions.requestScreenRecording() { permissions.openScreenRecordingSettings() }
-    }
+    private func authorizeAndPerform(
+        _ action: PendingPermissionAction,
+        hideDynamicIslandDuringCapture: Bool = false,
+        initialDisplayCaptures: [CaptureResult] = []
+    ) {
+        if pendingPermissionAction != nil {
+            clearPendingPermissionAction()
+        }
+        pendingCaptureSuppressesDynamicIsland = hideDynamicIslandDuringCapture
+        permissions.refresh()
+        let missingPermissions = action.requiredPermissions.filter { !permissions.isGranted($0) }
+        guard !missingPermissions.isEmpty else {
+            let shouldHideDynamicIsland = pendingCaptureSuppressesDynamicIsland
+            pendingCaptureSuppressesDynamicIsland = false
+            performPermissionAction(
+                action,
+                hideDynamicIsland: shouldHideDynamicIsland,
+                initialDisplayCaptures: initialDisplayCaptures
+            )
+            return
+        }
+        guard ensureInstalledForPermissions() else {
+            pendingCaptureSuppressesDynamicIsland = false
+            return
+        }
 
-    func repairScreenPermission() {
-        guard ensureInstalledForPermissions() else { return }
-        let alert = NSAlert()
-        alert.alertStyle = .warning
-        alert.messageText = "修复 HelloX 屏幕录制授权？"
-        alert.informativeText = "这只会清除 HelloX 自己的旧屏幕录制授权。随后请在系统提示或系统设置中重新允许，并重启 HelloX。"
-        alert.addButton(withTitle: "重置并重新授权")
+        let alert = HelloXAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "\(action.featureName)需要授权"
+        let permissionLines = missingPermissions.map {
+            "• \($0.displayName)：\(permissionPurpose($0, for: action))"
+        }.joined(separator: "\n")
+        alert.informativeText = "HelloX 需要以下权限才能继续：\n\n\(permissionLines)\n\n确认后，macOS 会将 HelloX 登记到对应授权列表并打开系统授权页面。请开启开关并完成密码或 Touch ID 验证。"
+        alert.addButton(withTitle: "前往开启")
+        if case .translateSelection = action {
+            alert.addButton(withTitle: "使用剪贴板保留排版")
+        }
         alert.addButton(withTitle: "取消")
         NSApp.activate(ignoringOtherApps: true)
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        performScreenPermissionReset()
-    }
 
-    private func performScreenPermissionReset() {
-        do {
-            try resetTCC(service: "ScreenCapture")
-            permissions.resetScreenPermissionFlow()
-            if permissions.requestScreenRecording() {
-                restartApplication()
-            } else {
-                permissions.openScreenRecordingSettings()
-            }
-        } catch {
-            lastError = "无法重置屏幕录制授权：\(error.localizedDescription)"
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn {
+            beginPermissionFlow(for: action)
+        } else if response == .alertSecondButtonReturn,
+                  case .translateSelection(let processID) = action {
+            pendingCaptureSuppressesDynamicIsland = false
+            UserDefaults.standard.set(true, forKey: "did-allow-selection-clipboard-fallback")
+            translateSelectedText(from: pid_t(processID))
+        } else {
+            pendingCaptureSuppressesDynamicIsland = false
         }
     }
 
-    private func presentScreenPermissionRecovery() {
-        guard ensureInstalledForPermissions() else { return }
-        lastError = "当前运行版本没有可用的屏幕录制权限。请点击“修复授权”，重新允许后重启 HelloX。"
-        showSettings()
+    private func permissionPurpose(
+        _ permission: PrivacyPermission,
+        for action: PendingPermissionAction
+    ) -> String {
+        switch permission {
+        case .screenRecording:
+            return action == .screenRecording ? "读取用户选择的屏幕区域并录制画面" : "读取用户选择的屏幕内容"
+        case .accessibility:
+            if case .translateSelection = action { return "读取用户主动选择的文字" }
+            return "向目标应用发送滚动操作并识别滚动区域"
+        }
     }
 
-    func repairAccessibilityPermission() {
-        guard ensureInstalledForPermissions() else { return }
-        do {
-            try resetTCC(service: "Accessibility")
-            requestAccessibilityPermission()
-        } catch {
-            lastError = "无法重置辅助功能授权：\(error.localizedDescription)"
+    private func beginPermissionFlow(for action: PendingPermissionAction) {
+        pendingPermissionAction = action
+        pendingPermissionStore.save(action)
+        permissionRequestInFlight = false
+        requestedPermission = nil
+        awaitingPermissionReturn = false
+        requestNextMissingPermission()
+    }
+
+    private func requestNextMissingPermission() {
+        guard !permissionRequestInFlight, let action = pendingPermissionAction else { return }
+        permissions.refresh()
+        guard let permission = action.requiredPermissions.first(where: { !permissions.isGranted($0) }) else {
+            consumePendingPermissionAction()
+            return
         }
+
+        permissionRequestInFlight = true
+        requestedPermission = permission
+        let granted = permissions.request(permission)
+        permissions.refresh()
+        permissionRequestInFlight = false
+
+        if granted || permissions.isGranted(permission) {
+            requestedPermission = nil
+            requestNextMissingPermission()
+            return
+        }
+        if permission == .screenRecording,
+           permissions.screenRecordingState == .requiresRelaunch {
+            presentPermissionRestartPrompt()
+            return
+        }
+
+        awaitingPermissionReturn = true
+        permissions.openSettings(for: permission)
+    }
+
+    private func resumePendingPermissionAction(afterLaunch: Bool = false) {
+        guard !permissionRequestInFlight, let action = pendingPermissionAction else { return }
+        permissions.refresh(returnedFromSettings: !afterLaunch)
+        let missingPermissions = action.requiredPermissions.filter { !permissions.isGranted($0) }
+        if missingPermissions.isEmpty {
+            consumePendingPermissionAction()
+            return
+        }
+
+        if afterLaunch {
+            clearPendingPermissionAction()
+            return
+        }
+        guard awaitingPermissionReturn else { return }
+        awaitingPermissionReturn = false
+
+        if let requestedPermission,
+           !missingPermissions.contains(requestedPermission) {
+            self.requestedPermission = nil
+            requestNextMissingPermission()
+            return
+        }
+        if requestedPermission == .screenRecording,
+           permissions.screenRecordingState == .requiresRelaunch {
+            presentPermissionRestartPrompt()
+            return
+        }
+
+        let permissionName = requestedPermission?.displayName ?? missingPermissions[0].displayName
+        lastError = "尚未开启\(permissionName)权限，已取消继续执行\(action.featureName)。"
+        clearPendingPermissionAction()
+    }
+
+    private func consumePendingPermissionAction() {
+        guard let action = pendingPermissionAction else { return }
+        let shouldHideDynamicIsland = pendingCaptureSuppressesDynamicIsland
+        clearPendingPermissionAction()
+        performPermissionAction(action, hideDynamicIsland: shouldHideDynamicIsland)
+    }
+
+    private func clearPendingPermissionAction() {
+        pendingPermissionAction = nil
+        pendingPermissionStore.clear()
+        requestedPermission = nil
+        awaitingPermissionReturn = false
+        permissionRequestInFlight = false
+        pendingCaptureSuppressesDynamicIsland = false
+    }
+
+    private func performPermissionAction(
+        _ action: PendingPermissionAction,
+        hideDynamicIsland: Bool = false,
+        initialDisplayCaptures: [CaptureResult] = []
+    ) {
+        switch action {
+        case .capture(let mode, let targetProcessID):
+            performCapture(
+                mode,
+                targetProcessID: targetProcessID,
+                hideDynamicIsland: hideDynamicIsland,
+                initialDisplayCaptures: initialDisplayCaptures
+            )
+        case .screenRecording:
+            performScreenRecording(hideDynamicIsland: hideDynamicIsland)
+        case .captureAndOCR:
+            captureTextFromScreen(
+                hideDynamicIsland: hideDynamicIsland,
+                initialDisplayCaptures: initialDisplayCaptures
+            )
+        case .captureAndTranslate:
+            captureTextFromScreen(
+                runTranslation: true,
+                hideDynamicIsland: hideDynamicIsland,
+                initialDisplayCaptures: initialDisplayCaptures
+            )
+        case .translateSelection(let processID):
+            translateSelectedText(from: pid_t(processID))
+        case .manage:
+            permissions.refresh()
+        }
+    }
+
+    private func presentPermissionRestartPrompt() {
+        let alert = HelloXAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "重启 HelloX 以完成授权"
+        alert.informativeText = "macOS 已接受屏幕录制授权。重启 HelloX 后将自动继续刚才的操作。"
+        alert.addButton(withTitle: "重启并继续")
+        alert.addButton(withTitle: "稍后")
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn {
+            restartApplication()
+        } else {
+            clearPendingPermissionAction()
+        }
+    }
+
+    func requestScreenPermission() {
+        authorizeAndPerform(.manage(.screenRecording))
     }
 
     func restartApplication() {
@@ -498,16 +787,12 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func showMainWindow() {
-        mainDestination = .workbench
+    func showSettingsWindow(destination: SettingsDestination = .shortcuts) {
+        mainDestination = destination
         if settingsWindowController == nil {
             settingsWindowController = SettingsWindowController(model: self)
         }
         settingsWindowController?.present()
-    }
-
-    func showSettings() {
-        showMainWindow()
     }
 
     func showUtilityTool(_ tool: UtilityTool) {
@@ -538,8 +823,7 @@ final class AppModel: ObservableObject {
     }
 
     func requestAccessibilityPermission() {
-        guard ensureInstalledForPermissions() else { return }
-        if !permissions.requestAccessibility() { permissions.openAccessibilitySettings() }
+        authorizeAndPerform(.manage(.accessibility))
     }
 
     var isRunningFromDiskImage: Bool {
@@ -554,7 +838,7 @@ final class AppModel: ObservableObject {
 
     private func ensureInstalledForPermissions() -> Bool {
         guard isRunningFromDiskImage else { return true }
-        let alert = NSAlert()
+        let alert = HelloXAlert()
         alert.alertStyle = .warning
         alert.messageText = "请先安装 HelloX"
         alert.informativeText = "当前正在从只读安装镜像运行。macOS 无法为这个临时副本稳定保存屏幕录制和辅助功能权限。请安装 HelloX，退出当前副本，再从“应用程序”中打开。"
@@ -563,21 +847,6 @@ final class AppModel: ObservableObject {
         NSApp.activate(ignoringOtherApps: true)
         if alert.runModal() == .alertFirstButtonReturn { revealRunningApplication() }
         return false
-    }
-
-    private func resetTCC(service: String) throws {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
-        process.arguments = ["reset", service, Bundle.main.bundleIdentifier ?? "com.hellox.app"]
-        let pipe = Pipe()
-        process.standardError = pipe
-        try process.run()
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else {
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let message = String(data: data, encoding: .utf8) ?? "tccutil 返回错误"
-            throw HelloXError.captureFailed(message.trimmingCharacters(in: .whitespacesAndNewlines))
-        }
     }
 
     private func handleCaptureError(_ error: Error) {
@@ -598,7 +867,6 @@ final class AppModel: ObservableObject {
         preservesOverlayUntilHandoff: Bool = false,
         prefersDisplayTargetForClick: Bool = false
     ) async throws -> CGRect {
-        promptForSemanticSelectionAccessibilityIfNeeded()
         return try await withCheckedThrowingContinuation { continuation in
             let controller = SelectionOverlayController(
                 allowedRect: allowedRect,
@@ -620,40 +888,36 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func promptForSemanticSelectionAccessibilityIfNeeded() {
-        permissions.refresh()
-        guard !permissions.canUseAccessibility,
-              !promptedSemanticSelectionAccessibility,
-              ensureInstalledForPermissions() else {
-            return
-        }
-        promptedSemanticSelectionAccessibility = true
-        _ = permissions.requestAccessibility(prompt: true)
-    }
-
     private struct SelectedFrozenDisplay {
         let result: CaptureResult
         let frame: CGRect
         let selection: CGRect
     }
 
-    private func selectRegionAcrossDisplays() async throws -> SelectedFrozenDisplay {
-        let screenPoints = NSScreen.screens.map {
-            coreGraphicsPoint(fromAppKit: CGPoint(x: $0.frame.midX, y: $0.frame.midY))
-        }
-        let captureService = capturer
-        let results = try await withThrowingTaskGroup(of: CaptureResult.self) { group in
-            for point in screenPoints {
-                group.addTask {
-                    try await captureService.captureDisplay(
-                        containing: point,
-                        excludingOwnApplication: false
-                    )
-                }
+    private func selectRegionAcrossDisplays(
+        initialResults: [CaptureResult] = []
+    ) async throws -> SelectedFrozenDisplay {
+        let results: [CaptureResult]
+        if initialResults.isEmpty {
+            let screenPoints = NSScreen.screens.map {
+                coreGraphicsPoint(fromAppKit: CGPoint(x: $0.frame.midX, y: $0.frame.midY))
             }
-            var values: [CaptureResult] = []
-            for try await result in group { values.append(result) }
-            return values
+            let captureService = capturer
+            results = try await withThrowingTaskGroup(of: CaptureResult.self) { group in
+                for point in screenPoints {
+                    group.addTask {
+                        try await captureService.captureDisplay(
+                            containing: point,
+                            excludingOwnApplication: false
+                        )
+                    }
+                }
+                var values: [CaptureResult] = []
+                for try await result in group { values.append(result) }
+                return values
+            }
+        } else {
+            results = initialResults
         }
         let uniqueResults = results.reduce(into: [CaptureResult]()) { values, result in
             guard !values.contains(where: { $0.capturedRect == result.capturedRect }) else { return }
@@ -666,7 +930,7 @@ final class AppModel: ObservableObject {
         }
         let selection = try await selectRegion(
             frozenDisplays: frozenDisplays,
-            rendersFrozenBackdrop: false,
+            rendersFrozenBackdrop: !initialResults.isEmpty,
             preservesOverlayUntilHandoff: true
         )
         guard let index = SelectionScreenPolicy.bestDisplayIndex(for: selection, displayFrames: frames) else {
@@ -775,7 +1039,8 @@ final class AppModel: ObservableObject {
         runTranslation: Bool = false,
         startsScrolling: Bool = false,
         rendersCapturedImagePreview: Bool = false,
-        scrollProcessID: pid_t? = nil
+        scrollProcessID: pid_t? = nil,
+        detectedScrollableRegions: [ScrollableRegion] = []
     ) {
         guard let screen = screen(withLargestIntersection: selection) else {
             dismissSelectionOverlay()
@@ -834,6 +1099,10 @@ final class AppModel: ObservableObject {
         controller.onClose = { [weak self, weak controller] in
             guard let self, let controller else { return }
             self.captureOverlays.removeAll { $0 === controller }
+            if captureOverlays.isEmpty, recordingController == nil, !captureSessionActive {
+                activeCaptureSuppressesDynamicIsland = false
+            }
+            updateDynamicIslandSuppression()
         }
         controller.show()
     }
@@ -846,8 +1115,9 @@ final class AppModel: ObservableObject {
     private func showPinnedImage(_ image: CGImage, frame: CGRect) {
         let controller = PinnedImageWindowController(image: image, frame: frame)
         pinnedWindows.append(controller)
-        controller.onEdit = { [weak self] in
+        controller.onEdit = { [weak self, weak controller] in
             guard let self else { return }
+            controller?.close()
             let result = CaptureResult(
                 image: image,
                 displayScale: 1,
@@ -885,21 +1155,36 @@ final class AppModel: ObservableObject {
         controller.present()
     }
 
-    private func showTranslation(_ context: TranslationWindowContext) {
+    private func showTranslationWindow(_ context: TranslationWindowContext) {
         if let translationWindow {
             translationWindow.update(context: context)
             return
         }
         let controller = TranslationWindowController(
             context: context,
-            appModel: self,
-            onOpenOCR: { [weak self] payload in
-                self?.showOCR(image: payload.image, payload: payload)
-            }
+            appModel: self
         )
         translationWindow = controller
         controller.onClose = { [weak self] in self?.translationWindow = nil }
         controller.present()
+    }
+
+    /// Picks the best detected scrollable region for a user selection.
+    /// Prefers regions fully contained in the selection; falls back to the
+    /// largest region that overlaps significantly.
+    private static func bestScrollableRegion(
+        for selection: CGRect,
+        in regions: [ScrollableRegion]
+    ) -> ScrollableRegion? {
+        guard !regions.isEmpty else { return nil }
+        if let contained = regions.first(where: { selection.contains($0.bounds) }) {
+            return contained
+        }
+        return regions
+            .filter { $0.bounds.intersects(selection) }
+            .max { a, b in
+                a.bounds.intersection(selection).area < b.bounds.intersection(selection).area
+            }
     }
 
     private func screen(withLargestIntersection rect: CGRect) -> NSScreen? {
@@ -953,7 +1238,7 @@ final class AppModel: ObservableObject {
     func provider(for request: TranslationRequest, profileID: UUID? = nil) throws -> any TranslationProvider {
         let requestedID = profileID ?? defaultTranslationProfileID
         guard let profile = translationProfiles.first(where: {
-            $0.id == requestedID && $0.isEnabled && $0.vendor != .local
+            $0.id == requestedID && $0.isEnabled && $0.vendor.supportsTextTranslation
         }) else {
             throw HelloXError.invalidConfiguration("请选择一个已启用的翻译配置")
         }
@@ -964,19 +1249,18 @@ final class AppModel: ObservableObject {
     }
 
     var enabledTranslationProfiles: [TranslationProfile] {
-        translationProfiles.filter { $0.isEnabled && $0.vendor != .local }
+        translationProfiles.filter { $0.isEnabled && $0.vendor.supportsTextTranslation }
+    }
+
+    var defaultTextTranslationProfile: TranslationProfile? {
+        guard let defaultTranslationProfileID else { return nil }
+        return translationProfiles.first {
+            $0.id == defaultTranslationProfileID && $0.isEnabled && $0.vendor.supportsTextTranslation
+        }
     }
 
     var enabledTranslationServiceCount: Int {
         (isOfflineTranslationEnabled ? 1 : 0) + enabledTranslationProfiles.count
-    }
-
-    @discardableResult
-    func addTranslationProfile(_ vendor: TranslationVendor) -> TranslationProfile {
-        let profile = TranslationProfile.preset(vendor)
-        translationProfiles.append(profile)
-        persistTranslationProfiles()
-        return profile
     }
 
     func saveTranslationProfile(_ profile: TranslationProfile, apiKey: String) {
@@ -996,22 +1280,11 @@ final class AppModel: ObservableObject {
         persistTranslationProfiles()
     }
 
-    func duplicateTranslationProfile(_ id: UUID) -> TranslationProfile? {
-        guard var profile = translationProfiles.first(where: { $0.id == id }) else { return nil }
-        let oldID = profile.id
-        profile.id = UUID()
-        profile.name += " 副本"
-        translationProfiles.append(profile)
-        if let key = apiKey(for: oldID), !key.isEmpty {
-            translationAPIKeys[profile.id.uuidString] = key
-        }
-        persistTranslationProfiles()
-        return profile
-    }
-
     func deleteTranslationProfile(_ id: UUID) {
         guard let profile = translationProfiles.first(where: { $0.id == id }) else { return }
-        if profile.isEnabled && enabledTranslationServiceCount <= 1 {
+        if profile.isEnabled,
+           profile.vendor.supportsTextTranslation,
+           enabledTranslationServiceCount <= 1 {
             lastError = "至少保留一个启用的翻译服务。"
             return
         }
@@ -1021,15 +1294,12 @@ final class AppModel: ObservableObject {
         persistTranslationProfiles()
     }
 
-    func setDefaultTranslationProfile(_ id: UUID) {
-        guard translationProfiles.contains(where: { $0.id == id && $0.isEnabled }) else { return }
-        defaultTranslationProfileID = id
-        persistTranslationProfiles()
-    }
-
     func setTranslationProfileEnabled(_ id: UUID, enabled: Bool) {
         guard let index = translationProfiles.firstIndex(where: { $0.id == id }) else { return }
-        if !enabled && translationProfiles[index].isEnabled && enabledTranslationServiceCount <= 1 {
+        if !enabled,
+           translationProfiles[index].isEnabled,
+           translationProfiles[index].vendor.supportsTextTranslation,
+           enabledTranslationServiceCount <= 1 {
             lastError = "至少保留一个启用的翻译服务。"
             return
         }
@@ -1051,6 +1321,18 @@ final class AppModel: ObservableObject {
         persistTranslationProfiles()
     }
 
+    func setScreenshotTranslationTargetLanguage(_ language: SupportedLanguage) {
+        guard language != .auto, language != screenshotTranslationTargetLanguage else { return }
+        screenshotTranslationTargetLanguage = language
+        UserDefaults.standard.set(language.rawValue, forKey: Self.screenshotTranslationTargetLanguageKey)
+    }
+
+    func setDefaultTranslationProfile(_ id: UUID) {
+        guard enabledTranslationProfiles.contains(where: { $0.id == id }) else { return }
+        defaultTranslationProfileID = id
+        persistTranslationProfiles()
+    }
+
     func apiKey(for profileID: UUID) -> String? {
         translationAPIKeys[profileID.uuidString]
     }
@@ -1067,32 +1349,15 @@ final class AppModel: ObservableObject {
     }
 
     private func normalizeDefaultTranslationProfile() {
+        if enabledTranslationProfiles.isEmpty {
+            isOfflineTranslationEnabled = true
+        }
         guard let currentID = defaultTranslationProfileID,
-              translationProfiles.contains(where: { $0.id == currentID && $0.isEnabled && $0.vendor != .local }) else {
+              translationProfiles.contains(where: {
+                  $0.id == currentID && $0.isEnabled && $0.vendor.supportsTextTranslation
+              }) else {
             defaultTranslationProfileID = enabledTranslationProfiles.first?.id
             return
-        }
-    }
-
-    func saveShortcuts() {
-        guard let shortcutApplyHandler else { return }
-        if let error = ShortcutConflictDetector.validationError(in: shortcutBindings) {
-            shortcutValidationMessage = error.localizedDescription
-            shortcutConflictMessages[error.action] = error.reason
-            lastError = error.localizedDescription
-            return
-        }
-        switch shortcutApplyHandler(shortcutBindings) {
-        case .success:
-            ShortcutPreferences.save(shortcutBindings)
-            shortcutValidationMessage = nil
-            shortcutConflictMessages.removeAll()
-            lastError = nil
-        case .failure(let error):
-            lastError = error.localizedDescription
-            shortcutValidationMessage = error.localizedDescription
-            shortcutConflictMessages[error.action] = error.reason
-            shortcutBindings = ShortcutPreferences.load()
         }
     }
 
@@ -1120,11 +1385,6 @@ final class AppModel: ObservableObject {
         var candidate = shortcutBindings
         candidate[action] = nil
         applyShortcutCandidate(candidate, changedAction: action)
-    }
-
-    func resetShortcut(_ action: ShortcutAction) {
-        if let binding = action.defaultBinding { setShortcut(action, binding: binding) }
-        else { clearShortcut(action) }
     }
 
     func resetAllShortcuts() {
@@ -1191,16 +1451,4 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func presentOnboardingIfNeeded() {
-        guard ensureInstalledForPermissions() else { return }
-        guard !UserDefaults.standard.bool(forKey: "did-show-onboarding") else { return }
-        UserDefaults.standard.set(true, forKey: "did-show-onboarding")
-        let alert = NSAlert()
-        alert.messageText = "欢迎使用 HelloX"
-        alert.informativeText = "截图需要屏幕录制权限；滚动长截图和划词翻译会在首次使用时另外申请辅助功能权限。截图与 OCR 默认在本机处理。"
-        alert.addButton(withTitle: "授权屏幕录制")
-        alert.addButton(withTitle: "稍后")
-        NSApp.activate(ignoringOtherApps: true)
-        if alert.runModal() == .alertFirstButtonReturn { requestScreenPermission() }
-    }
 }

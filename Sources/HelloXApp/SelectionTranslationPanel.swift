@@ -1,5 +1,6 @@
 import AppKit
 import HelloXCore
+import NaturalLanguage
 import SwiftUI
 @preconcurrency import Translation
 
@@ -18,6 +19,7 @@ final class OCRResultWindowModel: ObservableObject {
     private var image: CGImage
     private var task: Task<Void, Never>?
     private var recognitionID = UUID()
+    var closeWindow: (() -> Void)?
 
     init(image: CGImage, payload: OCRResultPayload? = nil, appModel: AppModel) {
         self.image = image
@@ -76,18 +78,10 @@ final class OCRResultWindowModel: ObservableObject {
         CopyFeedbackPresenter.shared.showSuccess("识别文字已复制")
     }
 
-    func saveTXT() {
+    func translateText() {
         guard !text.isEmpty else { return }
-        let panel = NSSavePanel()
-        panel.allowedContentTypes = [.plainText]
-        panel.nameFieldStringValue = "HelloX-OCR.txt"
-        panel.canCreateDirectories = true
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        do {
-            try text.write(to: url, atomically: true, encoding: .utf8)
-        } catch {
-            errorMessage = Self.message(for: error)
-        }
+        appModel.showTranslation(.ocrText(text))
+        closeWindow?()
     }
 
     private static func message(for error: Error) -> String {
@@ -103,11 +97,17 @@ final class OCRResultWindowController: NSWindowController, NSWindowDelegate {
     init(image: CGImage, payload: OCRResultPayload? = nil, appModel: AppModel) {
         model = OCRResultWindowModel(image: image, payload: payload, appModel: appModel)
         let window = HelloXWindowFactory.make(title: "HelloX 文字识别", size: NSSize(width: 560, height: 620))
-        window.contentViewController = NSHostingController(rootView: OCRResultWindowView(model: model))
+        let content = OCRResultWindowView(model: model)
+        window.contentViewController = HXDialogHostingController(
+            rootView: HXDialogWindowContent(title: "文字识别", onClose: { [weak window] in window?.performClose(nil) }) {
+                content
+            }, minimumSize: NSSize(width: 420, height: 380)
+        )
         window.setContentSize(NSSize(width: 560, height: 620))
         super.init(window: window)
         window.delegate = self
         window.center()
+        model.closeWindow = { [weak self] in self?.window?.close() }
     }
 
     @available(*, unavailable)
@@ -125,14 +125,14 @@ final class OCRResultWindowController: NSWindowController, NSWindowDelegate {
 @MainActor
 enum TranslationWindowContext {
     case manual
-    case screenshot(CGImage)
     case selectedText(SelectedTextContext)
+    case ocrText(String)
 
     var title: String {
         switch self {
         case .manual: "HelloX 文本翻译"
-        case .screenshot: "HelloX 截图翻译"
         case .selectedText: "HelloX 划词翻译"
+        case .ocrText: "HelloX 文字翻译"
         }
     }
 
@@ -143,6 +143,7 @@ struct TranslationModelOutput: Identifiable, Equatable, Sendable {
 
     let id: UUID
     let profileName: String
+    let vendor: TranslationVendor
     let isOffline: Bool
     var translatedText = ""
     var errorMessage = ""
@@ -151,6 +152,7 @@ struct TranslationModelOutput: Identifiable, Equatable, Sendable {
     init(
         id: UUID,
         profileName: String,
+        vendor: TranslationVendor = .local,
         isOffline: Bool = false,
         translatedText: String = "",
         errorMessage: String = "",
@@ -158,6 +160,7 @@ struct TranslationModelOutput: Identifiable, Equatable, Sendable {
     ) {
         self.id = id
         self.profileName = profileName
+        self.vendor = vendor
         self.isOffline = isOffline
         self.translatedText = translatedText
         self.errorMessage = errorMessage
@@ -182,13 +185,12 @@ private struct OfflineTranslationRequest: Sendable {
     let text: String
     let sourceLanguageIdentifier: String?
     let targetLanguageIdentifier: String
+    let layoutTemplate: TextLayoutTemplate?
 }
 
 @MainActor
 final class TranslationWindowModel: ObservableObject {
     @Published private(set) var errorMessage = ""
-    @Published private(set) var isLoadingOCR = false
-    @Published private(set) var ocrPayload: OCRResultPayload?
     @Published private(set) var outputs: [TranslationModelOutput] = []
     @Published var sourceText = ""
     @Published var sourceLanguage: SupportedLanguage = .auto
@@ -202,7 +204,7 @@ final class TranslationWindowModel: ObservableObject {
     private var operationID = UUID()
     private(set) var offlineRequestID = UUID()
     private var offlineRequest: OfflineTranslationRequest?
-    var onOpenOCR: ((OCRResultPayload) -> Void)?
+    private var hasStarted = false
 
     init(
         context: TranslationWindowContext,
@@ -215,48 +217,40 @@ final class TranslationWindowModel: ObservableObject {
             try appModel.provider(for: request, profileID: profileID)
         }
         resetOutputs()
-        apply(context)
+        configure(context)
     }
 
     var title: String { context.title }
     var profiles: [TranslationProfile] { appModel.enabledTranslationProfiles }
     var isOfflineTranslationEnabled: Bool { appModel.isOfflineTranslationEnabled }
-    var modeTitle: String {
-        switch context {
-        case .manual: "文本翻译"
-        case .screenshot: "截图翻译"
-        case .selectedText: "划词翻译"
-        }
-    }
-    var isScreenshot: Bool {
-        if case .screenshot = context { return true }
-        return false
-    }
     var isLoadingTranslation: Bool { outputs.contains(where: \.isLoading) }
     var enabledModelCount: Int { profiles.count + (isOfflineTranslationEnabled ? 1 : 0) }
 
     func update(context: TranslationWindowContext) {
         task?.cancel()
         operationID = UUID()
+        hasStarted = true
         self.context = context
         sourceText = ""
         errorMessage = ""
-        ocrPayload = nil
-        isLoadingOCR = false
         resetOutputs()
-        apply(context)
+        configure(context)
+        startTranslation(for: context)
     }
 
-    func retry() {
-        switch context {
-        case .screenshot where sourceText.isEmpty: runScreenshotPipeline()
-        case .manual, .screenshot, .selectedText: translate()
-        }
+    /// Source content and language choices are configured during model
+    /// initialization so the first visible frame already has its final layout.
+    /// Translation starts only after SwiftUI has mounted the view because the
+    /// offline `translationTask` must already be observing its configuration.
+    func startIfNeeded() {
+        guard !hasStarted else { return }
+        hasStarted = true
+        startTranslation(for: context)
     }
 
     func translate() {
-        let text = sourceText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else {
+        let text = sourceText
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             errorMessage = HelloXError.noTextFound.localizedDescription
             return
         }
@@ -264,13 +258,27 @@ final class TranslationWindowModel: ObservableObject {
         startTranslations(text: text, operationID: operationID)
     }
 
-    func openOCR() {
-        guard let ocrPayload else { return }
-        onOpenOCR?(ocrPayload)
-    }
-
     func copySource() {
         copyToPasteboard(sourceText, successMessage: "原文已复制")
+    }
+
+    func swapLanguages() {
+        let previousTarget = targetLanguage
+        var nextTarget = sourceLanguage
+        if nextTarget == .auto {
+            let recognizer = NLLanguageRecognizer()
+            recognizer.processString(sourceText)
+            let detected = recognizer.dominantLanguage.flatMap { SupportedLanguage(rawValue: $0.rawValue) }
+            // Automatic detection is only a source option. Without a distinct
+            // detected language, use the usual Chinese/English reverse pair.
+            nextTarget = detected.flatMap { $0 != previousTarget ? $0 : nil }
+                ?? (previousTarget == .english ? .simplifiedChinese : .english)
+        }
+        _ = beginOperation()
+        offlineRequest = nil
+        offlineTranslationConfiguration = nil
+        sourceLanguage = previousTarget
+        targetLanguage = nextTarget
     }
 
     func clearSource() {
@@ -280,7 +288,6 @@ final class TranslationWindowModel: ObservableObject {
         offlineTranslationConfiguration = nil
         sourceText = ""
         errorMessage = ""
-        isLoadingOCR = false
         resetOutputs()
     }
 
@@ -322,57 +329,30 @@ final class TranslationWindowModel: ObservableObject {
         CopyFeedbackPresenter.shared.showSuccess(successMessage)
     }
 
-    private func apply(_ context: TranslationWindowContext) {
+    private func configure(_ context: TranslationWindowContext) {
         switch context {
         case .manual:
             sourceLanguage = .auto
             targetLanguage = .simplifiedChinese
-        case .screenshot:
-            sourceLanguage = .auto
-            targetLanguage = .simplifiedChinese
-            runScreenshotPipeline()
         case .selectedText(let selected):
             sourceText = selected.text
             sourceLanguage = selected.detectedLanguage ?? .auto
             targetLanguage = selected.detectedLanguage == .simplifiedChinese || selected.detectedLanguage == .traditionalChinese
                 ? .english
                 : .simplifiedChinese
-            translate()
+        case .ocrText(let text):
+            sourceText = text
+            sourceLanguage = .auto
+            targetLanguage = .simplifiedChinese
         }
     }
 
-    private func runScreenshotPipeline() {
-        guard case .screenshot(let image) = context else { return }
-        let operationID = beginOperation()
-        sourceText = ""
-        errorMessage = ""
-        ocrPayload = nil
-        isLoadingOCR = true
-        task = Task { @MainActor [weak self] in
-            guard let self else { return }
-            do {
-                let result = try await appModel.ocrService.recognizeText(in: image)
-                try Task.checkCancellation()
-                guard self.operationID == operationID else { return }
-                sourceText = result.text
-                ocrPayload = OCRResultPayload(image: image, result: result)
-                if sourceLanguage == .auto,
-                   let detected = result.language.flatMap(SupportedLanguage.init(rawValue:)) {
-                    sourceLanguage = detected
-                    if targetLanguage == detected {
-                        targetLanguage = detected == .simplifiedChinese || detected == .traditionalChinese
-                            ? .english
-                            : .simplifiedChinese
-                    }
-                }
-                isLoadingOCR = false
-                startTranslations(text: result.text, operationID: operationID)
-            } catch is CancellationError {
-            } catch {
-                guard self.operationID == operationID else { return }
-                isLoadingOCR = false
-                errorMessage = Self.message(for: error)
-            }
+    private func startTranslation(for context: TranslationWindowContext) {
+        switch context {
+        case .manual:
+            break
+        case .selectedText, .ocrText:
+            translate()
         }
     }
 
@@ -391,13 +371,19 @@ final class TranslationWindowModel: ObservableObject {
             TranslationModelOutput(
                 id: $0.id,
                 profileName: $0.name,
+                vendor: $0.vendor,
                 errorMessage: allowsCloudTranslation ? "" : "已取消发送到云端。",
                 isLoading: allowsCloudTranslation
             )
         }
         let request = TranslationRequest(text: text, sourceLanguage: sourceLanguage, targetLanguage: targetLanguage)
+        let layoutTemplate: TextLayoutTemplate? = {
+            guard case .selectedText = context else { return nil }
+            let template = TextLayoutTemplate(sourceText: text)
+            return template.units.isEmpty ? nil : template
+        }()
         if isOfflineTranslationEnabled {
-            requestOfflineTranslation(text: text, operationID: operationID)
+            requestOfflineTranslation(text: text, operationID: operationID, layoutTemplate: layoutTemplate)
         } else {
             offlineRequest = nil
             offlineTranslationConfiguration = nil
@@ -419,10 +405,19 @@ final class TranslationWindowModel: ObservableObject {
                 for job in jobs {
                     group.addTask {
                         do {
-                            let result = try await job.provider.translate(request)
+                            let translatedText: String
+                            if let layoutTemplate {
+                                translatedText = try await Self.translate(
+                                    layoutTemplate: layoutTemplate,
+                                    request: request,
+                                    using: job.provider
+                                )
+                            } else {
+                                translatedText = try await job.provider.translate(request).text
+                            }
                             return TranslationCompletion(
                                 profileID: job.profileID,
-                                translatedText: result.text,
+                                translatedText: translatedText,
                                 errorMessage: nil
                             )
                         } catch {
@@ -451,7 +446,6 @@ final class TranslationWindowModel: ObservableObject {
         task?.cancel()
         let operationID = UUID()
         self.operationID = operationID
-        isLoadingOCR = false
         errorMessage = ""
         resetOutputs()
         return operationID
@@ -460,7 +454,7 @@ final class TranslationWindowModel: ObservableObject {
     private func resetOutputs() {
         let offlineOutputs = isOfflineTranslationEnabled ? [Self.offlineOutput()] : []
         outputs = offlineOutputs + profiles.map {
-            TranslationModelOutput(id: $0.id, profileName: $0.name)
+            TranslationModelOutput(id: $0.id, profileName: $0.name, vendor: $0.vendor)
         }
     }
 
@@ -473,7 +467,11 @@ final class TranslationWindowModel: ObservableObject {
         )
     }
 
-    private func requestOfflineTranslation(text: String, operationID: UUID) {
+    private func requestOfflineTranslation(
+        text: String,
+        operationID: UUID,
+        layoutTemplate: TextLayoutTemplate?
+    ) {
         let requestID = UUID()
         offlineRequestID = requestID
         offlineRequest = OfflineTranslationRequest(
@@ -481,7 +479,8 @@ final class TranslationWindowModel: ObservableObject {
             operationID: operationID,
             text: text,
             sourceLanguageIdentifier: sourceLanguage.systemLanguageIdentifier,
-            targetLanguageIdentifier: targetLanguage.systemLanguageIdentifier ?? targetLanguage.rawValue
+            targetLanguageIdentifier: targetLanguage.systemLanguageIdentifier ?? targetLanguage.rawValue,
+            layoutTemplate: layoutTemplate
         )
         let source = sourceLanguage.systemLanguageIdentifier.map(Locale.Language.init(identifier:))
         let target = Locale.Language(identifier: targetLanguage.systemLanguageIdentifier ?? targetLanguage.rawValue)
@@ -502,13 +501,38 @@ final class TranslationWindowModel: ObservableObject {
         outputs[index].errorMessage = errorMessage ?? ""
     }
 
+    nonisolated private static func translate(
+        layoutTemplate: TextLayoutTemplate,
+        request: TranslationRequest,
+        using provider: any TranslationProvider
+    ) async throws -> String {
+        var translations: [String] = []
+        translations.reserveCapacity(layoutTemplate.units.count)
+        for unit in layoutTemplate.units {
+            try Task.checkCancellation()
+            let result = try await provider.translate(TranslationRequest(
+                text: unit.sourceText,
+                sourceLanguage: request.sourceLanguage,
+                targetLanguage: request.targetLanguage
+            ))
+            guard !result.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw HelloXError.invalidResponse
+            }
+            translations.append(result.text)
+        }
+        guard let rendered = layoutTemplate.render(translations: translations) else {
+            throw HelloXError.invalidResponse
+        }
+        return rendered
+    }
+
     private func confirmCloudTranslationIfNeeded(profiles: [TranslationProfile]) -> Bool {
         let key = "did-confirm-cloud-text-translation"
         guard !UserDefaults.standard.bool(forKey: key) else { return true }
-        let alert = NSAlert()
+        let alert = HelloXAlert()
         alert.messageText = "允许发送文字？"
         let modelNames = profiles.map(\.name).joined(separator: "、")
-        alert.informativeText = "HelloX 会将原文同时发送给已启用的模型（\(modelNames)）并展示各自译文。截图翻译只发送 OCR 文字，不上传截图。"
+        alert.informativeText = "HelloX 会将原文同时发送给已启用的模型（\(modelNames)）并展示各自译文。"
         alert.addButton(withTitle: "允许并继续")
         alert.addButton(withTitle: "取消")
         guard alert.runModal() == .alertFirstButtonReturn else { return false }
@@ -534,13 +558,22 @@ final class TranslationWindowController: NSWindowController, NSWindowDelegate {
     let model: TranslationWindowModel
     var onClose: (() -> Void)?
 
-    init(context: TranslationWindowContext, appModel: AppModel, onOpenOCR: @escaping (OCRResultPayload) -> Void) {
+    init(context: TranslationWindowContext, appModel: AppModel) {
         model = TranslationWindowModel(context: context, appModel: appModel)
-        model.onOpenOCR = onOpenOCR
-        let window = HelloXWindowFactory.make(title: context.title, size: NSSize(width: 760, height: 780), level: .normal)
-        window.contentViewController = NSHostingController(rootView: TranslationWindowView(model: model))
-        window.setContentSize(NSSize(width: 760, height: 780))
-        window.minSize = NSSize(width: 640, height: 600)
+        // Fit the initial empty result rows. Later results keep the user's
+        // window size and use the existing scrolling content instead.
+        let initialHeight = min(720, 520 + max(0, model.enabledModelCount - 1) * 90)
+        let minimumSize = NSSize(width: 640, height: 500)
+        let initialSize = NSSize(width: minimumSize.width, height: CGFloat(initialHeight))
+        let window = HelloXWindowFactory.make(title: context.title, size: initialSize, level: .normal)
+        let content = TranslationWindowView(model: model)
+        window.contentViewController = HXDialogHostingController(
+            rootView: HXDialogWindowContent(title: context.title, onClose: { [weak window] in window?.performClose(nil) }) {
+                content
+            }, minimumSize: minimumSize
+        )
+        window.setContentSize(initialSize)
+        window.minSize = minimumSize
         super.init(window: window)
         window.delegate = self
         position(window, context: context)
@@ -556,7 +589,10 @@ final class TranslationWindowController: NSWindowController, NSWindowDelegate {
         present()
     }
 
-    func present() { HelloXWindowFactory.present(self, alwaysOnTop: false) }
+    func present() {
+        HelloXWindowFactory.present(self, alwaysOnTop: false)
+        model.startIfNeeded()
+    }
     func windowWillClose(_ notification: Notification) { onClose?() }
 
     private func position(_ window: NSWindow, context: TranslationWindowContext) {
@@ -606,7 +642,7 @@ private enum HelloXWindowFactory {
         window.hidesOnDeactivate = false
         window.isReleasedWhenClosed = false
         window.minSize = NSSize(width: 420, height: 380)
-        HelloXWindowStyle.apply(to: window, movableByBackground: false)
+        HelloXWindowStyle.applyDialog(to: window)
         return window
     }
 
@@ -626,19 +662,23 @@ private struct OCRResultWindowView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("识别结果").font(.system(size: 15, weight: .bold))
-                    Text("当前截图选区")
-                        .font(.system(size: 10.5))
-                        .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
-                }
+                Text("当前截图选区的识别结果")
+                    .font(HXTypography.caption)
+                    .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
                 Spacer()
-                HelloXIconButton(icon: .copy, help: "复制全部", action: model.copyAll)
+                HelloXUtilityTextButton(
+                    title: "翻译",
+                    help: "翻译识别结果",
+                    role: .accent,
+                    action: model.translateText
+                )
                     .disabled(model.text.isEmpty)
-                HelloXIconButton(icon: .save, help: "保存 TXT", action: model.saveTXT)
+                HelloXUtilityTextButton(
+                    title: "复制",
+                    help: "复制识别结果",
+                    action: model.copyAll
+                )
                     .disabled(model.text.isEmpty)
-                HelloXIconButton(icon: .textRecognition, help: "重新识别", action: model.recognize)
-                    .disabled(model.isLoading)
             }
             if model.isLoading {
                 HStack(spacing: 10) {
@@ -649,7 +689,7 @@ private struct OCRResultWindowView: View {
             } else if !model.errorMessage.isEmpty {
                 VStack(spacing: 12) {
                     HelloXStatusBanner(message: model.errorMessage, kind: .error)
-                    HelloXIconButton(icon: .update, help: "重试", role: .accent, action: model.recognize)
+                    HelloXUtilityTextButton(title: "重新识别", help: "重新识别截图文字", role: .accent, action: model.recognize)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
@@ -659,15 +699,15 @@ private struct OCRResultWindowView: View {
                         Spacer()
                         Text("可选择并复制")
                     }
-                    .font(.system(size: 10))
+                    .font(HXTypography.caption)
                     .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
                     .padding(.horizontal, 12)
                     .frame(height: 34)
-                    .background(HelloXTheme.controlBackground(for: colorScheme), in: RoundedRectangle(cornerRadius: 9))
+                    .background(HelloXTheme.controlBackground(for: colorScheme), in: RoundedRectangle(cornerRadius: HelloXTheme.controlRadius))
 
                     ScrollView {
                         Text(model.text)
-                            .font(.system(size: 12))
+                            .font(HXTypography.body)
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(18)
@@ -681,8 +721,11 @@ private struct OCRResultWindowView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .padding(22)
-        .background(HelloXGlowBackground().ignoresSafeArea())
+        .padding(.horizontal, HXDialogStyle.padding)
+        .padding(.bottom, HXDialogStyle.padding)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(HXDialogStyle.background(colorScheme).ignoresSafeArea())
+        .font(HXTypography.body)
         .tint(HelloXTheme.accent)
     }
 }
@@ -694,23 +737,38 @@ private struct TranslationWindowView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            header
             ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
+                VStack(alignment: .leading, spacing: 0) {
                     controls
-                    sourceCard
                     if !model.errorMessage.isEmpty {
                         HelloXStatusBanner(message: model.errorMessage, kind: .error)
+                            .padding(.vertical, HXSpacing.sm)
                     }
-                    resultsSection
+                    VStack(alignment: .leading, spacing: 0) {
+                        sourceCard
+                            .frame(maxWidth: .infinity, alignment: .top)
+                        Rectangle()
+                            .fill(HelloXTheme.border(for: colorScheme))
+                            .frame(height: 1)
+                        resultsSection
+                            .frame(maxWidth: .infinity, alignment: .top)
+                    }
+                    .background(HelloXTheme.surface(for: colorScheme))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: HelloXTheme.cardRadius, style: .continuous)
+                            .stroke(HelloXTheme.border(for: colorScheme), lineWidth: 1)
+                    }
+                    .clipShape(RoundedRectangle(cornerRadius: HelloXTheme.cardRadius, style: .continuous))
                 }
-                .padding(22)
+                .padding(.horizontal, HXDialogStyle.padding)
+                .padding(.bottom, HXDialogStyle.padding)
             }
             .scrollIndicators(.visible)
             .scrollContentBackground(.hidden)
             .visibleScrollChrome()
         }
-        .background(HelloXGlowBackground().ignoresSafeArea())
+        .background(HXDialogStyle.background(colorScheme).ignoresSafeArea())
+        .font(HXTypography.body)
         .tint(HelloXTheme.accent)
         .translationTask(model.offlineTranslationConfiguration) { session in
             let requestID = model.offlineRequestID
@@ -733,12 +791,27 @@ private struct TranslationWindowView: View {
                 if status == .supported {
                     try await session.prepareTranslation()
                 }
-                let response = try await session.translate(request.text)
+                let translatedText: String
+                if let layoutTemplate = request.layoutTemplate {
+                    var translations: [String] = []
+                    translations.reserveCapacity(layoutTemplate.units.count)
+                    for unit in layoutTemplate.units {
+                        try Task.checkCancellation()
+                        let response = try await session.translate(unit.sourceText)
+                        translations.append(response.targetText)
+                    }
+                    guard let rendered = layoutTemplate.render(translations: translations) else {
+                        throw HelloXError.invalidResponse
+                    }
+                    translatedText = rendered
+                } else {
+                    translatedText = try await session.translate(request.text).targetText
+                }
                 try Task.checkCancellation()
                 model.completeOfflineTranslation(
                     requestID: request.id,
                     operationID: request.operationID,
-                    translatedText: response.targetText,
+                    translatedText: translatedText,
                     errorMessage: nil
                 )
             } catch is CancellationError {
@@ -754,35 +827,19 @@ private struct TranslationWindowView: View {
         }
     }
 
-    private var header: some View {
-        HStack(spacing: 13) {
-            HelloXRowIcon(icon: .translation, size: 42)
-            Text(model.modeTitle)
-                .font(.system(size: 18, weight: .bold))
-                .foregroundStyle(HelloXTheme.primaryText(for: colorScheme))
-            Spacer()
-            HStack(spacing: 6) {
-                Circle()
-                    .fill(model.enabledModelCount > 0 ? HelloXTheme.success : HelloXTheme.warning)
-                    .frame(width: 7, height: 7)
-                Text("\(model.enabledModelCount) 个模型")
-                    .font(.system(size: 10.5, weight: .semibold))
-            }
-            .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
-            .padding(.horizontal, 10)
-            .frame(height: 30)
-            .background(HelloXTheme.controlBackground(for: colorScheme), in: Capsule())
-        }
-        .padding(.horizontal, 22)
-        .padding(.vertical, 17)
-        .background(HelloXTheme.surface(for: colorScheme).opacity(0.92))
-    }
-
     private var controls: some View {
         HStack(spacing: 12) {
             languagePicker(title: "源语言", selection: $model.sourceLanguage, includesAuto: true)
-            HelloXIcon(icon: .arrowRight, size: 15)
-                .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
+            Button(action: model.swapLanguages) {
+                Image(systemName: "arrow.left.arrow.right")
+                    .font(.system(size: 14, weight: .medium))
+                    .frame(width: 28, height: 28)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(HelloXTheme.iconForeground(for: colorScheme))
+            .help("交换源语言和目标语言")
+            .accessibilityLabel("交换源语言和目标语言")
             languagePicker(title: "目标语言", selection: $model.targetLanguage, includesAuto: false)
             Spacer(minLength: 12)
             Button(action: model.translate) {
@@ -797,14 +854,11 @@ private struct TranslationWindowView: View {
             }
             .buttonStyle(HelloXButtonStyle(role: .accent))
             .disabled(
-                model.isLoadingOCR ||
                 model.isLoadingTranslation ||
                 model.sourceText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             )
         }
-        .padding(14)
-        .background(HelloXTheme.surface(for: colorScheme), in: RoundedRectangle(cornerRadius: HelloXTheme.cardRadius, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: HelloXTheme.cardRadius).stroke(HelloXTheme.border(for: colorScheme)))
+        .padding(.bottom, 12)
     }
 
     private func languagePicker(
@@ -814,7 +868,7 @@ private struct TranslationWindowView: View {
     ) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(title)
-                .font(.system(size: 9.5, weight: .medium))
+                .font(HXTypography.caption)
                 .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
             HelloXLanguagePicker(
                 title: title,
@@ -828,54 +882,46 @@ private struct TranslationWindowView: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Text("原文")
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(HXTypography.section)
                 Spacer()
                 Text("\(model.sourceText.count) 字")
-                    .font(.system(size: 10, design: .monospaced))
+                    .font(HXTypography.caption).monospacedDigit()
                     .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
-                if model.isScreenshot {
-                    HelloXIconButton(icon: .textRecognition, help: "查看 OCR 识别结果", size: 34, iconSize: 15, action: model.openOCR)
-                        .disabled(model.ocrPayload == nil)
-                }
-                HelloXIconButton(icon: .copy, help: "复制原文", size: 34, iconSize: 15, action: model.copySource)
+                HelloXIconButton(icon: .copy, help: "复制原文", size: 34, iconSize: 16, action: model.copySource)
                     .disabled(model.sourceText.isEmpty)
-                HelloXIconButton(icon: .close, help: "清空原文", role: .destructive, size: 34, iconSize: 15, action: model.clearSource)
+                HelloXIconButton(icon: .close, help: "清空原文", role: .destructive, size: 34, iconSize: 16, action: model.clearSource)
                     .disabled(model.sourceText.isEmpty)
             }
 
             ZStack(alignment: .topLeading) {
-                if model.sourceText.isEmpty && !model.isLoadingOCR && !isSourceEditorFocused {
+                if model.sourceText.isEmpty && !isSourceEditorFocused {
                     Text("输入或粘贴需要翻译的文字…")
-                        .font(.system(size: 13))
-                        .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme).opacity(0.72))
+                        .font(HXTypography.body)
+                    .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
                         .padding(7)
                         .allowsHitTesting(false)
                 }
                 TextEditor(text: $model.sourceText)
-                    .font(.system(size: 13))
+                    .font(HXTypography.body)
                     .lineSpacing(3)
                     .padding(7)
                     .scrollContentBackground(.hidden)
                     .visibleScrollChrome()
                     .background(Color.clear)
                     .focused($isSourceEditorFocused)
-                    .disabled(model.isLoadingOCR)
             }
             .frame(minHeight: 150, maxHeight: 210)
             .background(HelloXTheme.controlBackground(for: colorScheme), in: RoundedRectangle(cornerRadius: HelloXTheme.controlRadius, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: HelloXTheme.controlRadius).stroke(HelloXTheme.border(for: colorScheme)))
         }
-        .padding(16)
-        .background(HelloXTheme.raisedSurface(for: colorScheme), in: RoundedRectangle(cornerRadius: HelloXTheme.cardRadius, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: HelloXTheme.cardRadius).stroke(HelloXTheme.border(for: colorScheme)))
-        .shadow(color: HelloXTheme.shadow(for: colorScheme), radius: 9, y: 4)
+        .padding(HXSpacing.md)
     }
 
     private var resultsSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Text("翻译结果")
-                    .font(.system(size: 14, weight: .bold))
+                    .font(HXTypography.section)
                 Spacer()
             }
 
@@ -883,21 +929,22 @@ private struct TranslationWindowView: View {
                 outputCard(output)
             }
         }
+        .padding(HXSpacing.md)
     }
 
     private func outputCard(_ output: TranslationModelOutput) -> some View {
-        VStack(alignment: .leading, spacing: 11) {
+        VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 10) {
-                HelloXRowIcon(icon: output.isOffline ? .translation : .cloud, size: 32)
+                TranslationServiceIcon(vendor: output.vendor, size: 32, logoSize: 24)
                 Text(output.profileName)
-                    .font(.system(size: 12.5, weight: .semibold))
+                    .font(HXTypography.section)
                 Spacer()
                 outputStatus(output)
                 HelloXIconButton(
                     icon: .copy,
                     help: "复制 \(output.profileName) 的译文",
                     size: 34,
-                    iconSize: 15,
+                    iconSize: 16,
                     action: { model.copyTranslation(outputID: output.id) }
                 )
                 .disabled(output.translatedText.isEmpty)
@@ -907,27 +954,31 @@ private struct TranslationWindowView: View {
                 HStack(spacing: 9) {
                     ProgressView().controlSize(.small)
                     Text("正在生成译文…")
-                        .font(.system(size: 11))
+                        .font(HXTypography.caption)
                         .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
                 }
-                .frame(minHeight: 58)
+                .frame(maxWidth: .infinity, alignment: .leading)
             } else if !output.errorMessage.isEmpty {
                 HelloXStatusBanner(message: output.errorMessage, kind: .error)
             } else {
                 Text(output.translatedText.isEmpty ? "等待翻译" : output.translatedText)
-                    .font(.system(size: 12.5))
+                    .font(HXTypography.body)
                     .foregroundStyle(
                         output.translatedText.isEmpty
                             ? HelloXTheme.secondaryText(for: colorScheme)
                             : HelloXTheme.primaryText(for: colorScheme)
                     )
                     .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, minHeight: 58, alignment: .topLeading)
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
-        .padding(15)
-        .background(HelloXTheme.raisedSurface(for: colorScheme), in: RoundedRectangle(cornerRadius: HelloXTheme.cardRadius, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: HelloXTheme.cardRadius).stroke(HelloXTheme.border(for: colorScheme)))
+        .padding(.vertical, HXSpacing.sm)
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(HelloXTheme.border(for: colorScheme))
+                .frame(height: 1)
+        }
     }
 
     @ViewBuilder
@@ -939,7 +990,7 @@ private struct TranslationWindowView: View {
             ? "翻译中"
             : (!output.errorMessage.isEmpty ? "失败" : (!output.translatedText.isEmpty ? "已完成" : "等待中"))
         Text(title)
-            .font(.system(size: 9.5, weight: .semibold))
+            .font(HXTypography.caption)
             .foregroundStyle(color)
             .padding(.horizontal, 8)
             .frame(height: 24)

@@ -42,7 +42,9 @@ enum TranslationProfilePreferences {
         legacyKeychain: any SecretStoring,
         defaults: UserDefaults = .standard
     ) -> TranslationProfileState {
-        if let data = defaults.data(forKey: storageKey),
+        let storedData = defaults.data(forKey: storageKey)
+
+        if let data = storedData,
            let state = try? JSONDecoder().decode(TranslationProfileState.self, from: data) {
             let storedProfiles = state.profiles
             var migrated = upgradingLegacyZhipuPreset(in: removingLocalProfiles(from: state))

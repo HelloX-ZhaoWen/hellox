@@ -35,6 +35,7 @@ public enum TranslationVendor: String, CaseIterable, Codable, Sendable, Identifi
 
     public var requiresModel: Bool { self == .zhipu }
     public var requiresAPIKey: Bool { self != .local }
+    public var supportsTextTranslation: Bool { self != .local }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
@@ -77,7 +78,7 @@ public struct TranslationProfile: Codable, Equatable, Sendable, Identifiable {
     }
 
     public static func preset(_ vendor: TranslationVendor) -> TranslationProfile {
-        TranslationProfile(
+        return TranslationProfile(
             name: vendor.displayName,
             vendor: vendor,
             model: vendor.defaultModel,
@@ -91,11 +92,9 @@ public struct TranslationProfile: Codable, Equatable, Sendable, Identifiable {
         }
         if vendor != .local {
             guard let url = URL(string: baseURL) else { throw HelloXError.invalidConfiguration("Base URL 无效") }
-            if vendor == .volcengine && url.scheme?.lowercased() != "https" {
-                throw HelloXError.invalidConfiguration("火山机器翻译必须使用 HTTPS")
-            }
-            if vendor == .niutrans && url.scheme?.lowercased() != "https" {
-                throw HelloXError.invalidConfiguration("小牛翻译必须使用 HTTPS")
+            if [.volcengine, .niutrans].contains(vendor),
+               url.scheme?.lowercased() != "https" {
+                throw HelloXError.invalidConfiguration("\(vendor.displayName)必须使用 HTTPS")
             }
         }
         if vendor.requiresModel && model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {

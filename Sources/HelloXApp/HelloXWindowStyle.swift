@@ -2,6 +2,16 @@ import AppKit
 
 @MainActor
 final class HelloXWindow: NSWindow {
+    override func order(_ place: NSWindow.OrderingMode, relativeTo otherWin: Int) {
+        if place != .out { DockVisibilityController.shared.windowWillShow(self) }
+        super.order(place, relativeTo: otherWin)
+    }
+
+    override func close() {
+        super.close()
+        DockVisibilityController.shared.windowDidClose(self)
+    }
+
     override func sendEvent(_ event: NSEvent) {
         if shouldToggleZoom(for: event) {
             zoom(nil)
@@ -188,7 +198,77 @@ final class HelloXResizeCursorView: NSView {
 
 @MainActor
 enum HelloXWindowStyle {
+    private static let windowControlLeadingInset: CGFloat = 16
+    private static let windowControlTopInset: CGFloat = 10
+
+    static func applyDialog(to window: NSWindow) {
+        window.appearance = nil
+        window.styleMask.insert(.fullSizeContentView)
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.titlebarSeparatorStyle = .none
+        window.toolbar = nil
+        window.tabbingMode = .disallowed
+        window.backgroundColor = .clear
+        window.isOpaque = false
+        window.hasShadow = true
+        window.isMovableByWindowBackground = true
+        for type in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+            window.standardWindowButton(type)?.isHidden = true
+        }
+    }
+
+    /// Standard document/tool windows leave title-bar layout and traffic-light
+    /// positioning to AppKit. Capture overlays keep their specialized chrome.
+    static func applyNative(to window: NSWindow) {
+        window.appearance = nil
+        window.titleVisibility = .visible
+        window.titlebarAppearsTransparent = false
+        window.titlebarSeparatorStyle = .automatic
+        window.backgroundColor = HelloXTheme.windowBackground
+        window.isOpaque = true
+        window.isMovableByWindowBackground = false
+        window.tabbingMode = .disallowed
+        window.toolbarStyle = .unified
+    }
+
+    static func applySettingsReference(to window: NSWindow) {
+        applyNative(to: window)
+        window.styleMask.insert(.fullSizeContentView)
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.titlebarSeparatorStyle = .none
+        window.toolbar = nil
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        DispatchQueue.main.async { [weak window] in
+            guard let window else { return }
+            positionSettingsWindowControls(in: window)
+        }
+    }
+
+    /// Codex uses hiddenInset with trafficLightPosition (16, 16), in points.
+    static func positionSettingsWindowControls(in window: NSWindow, topInset: CGFloat = 16) {
+        guard !window.styleMask.contains(.fullScreen),
+              let close = window.standardWindowButton(.closeButton),
+              let frameView = window.contentView?.superview else { return }
+        // Move the complete titlebar container. Moving only the button's
+        // immediate parent can draw the controls outside its ancestor's bounds,
+        // where AppKit hit testing routes clicks to the SwiftUI content instead.
+        var container: NSView = close
+        while let parent = container.superview, parent !== frameView {
+            container = parent
+        }
+        guard container !== close, container.superview === frameView else { return }
+        let closeInFrame = close.convert(close.bounds, to: frameView)
+        let desiredY = frameView.isFlipped ? topInset : frameView.bounds.height - topInset - close.frame.height
+        let offset = NSSize(width: 16 - closeInFrame.minX, height: desiredY - closeInFrame.minY)
+        container.setFrameOrigin(NSPoint(x: container.frame.minX + offset.width,
+                                         y: container.frame.minY + offset.height))
+    }
+
     static func apply(to window: NSWindow, movableByBackground: Bool = true) {
+        window.appearance = nil
         window.styleMask.formUnion([.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView])
         window.collectionBehavior.remove(.fullScreenAuxiliary)
         window.collectionBehavior.remove(.stationary)
@@ -213,6 +293,38 @@ enum HelloXWindowStyle {
         contentView.layer?.cornerCurve = .continuous
         contentView.layer?.masksToBounds = true
         installResizeCursorOverlay(in: contentView, for: window)
+
+        // AppKit lays out the standard controls after the transparent title bar
+        // is installed. Apply our visual inset on the next layout pass so the
+        // close button does not sit against the rounded window edge.
+        DispatchQueue.main.async { [weak window] in
+            guard let window else { return }
+            positionWindowControls(in: window)
+        }
+    }
+
+    private static func positionWindowControls(in window: NSWindow) {
+        guard let closeButton = window.standardWindowButton(.closeButton),
+              let container = closeButton.superview else { return }
+
+        let desiredCloseOrigin = NSPoint(
+            x: windowControlLeadingInset,
+            y: container.isFlipped
+                ? windowControlTopInset
+                : container.bounds.maxY - windowControlTopInset - closeButton.frame.height
+        )
+        let offset = NSSize(
+            width: desiredCloseOrigin.x - closeButton.frame.origin.x,
+            height: desiredCloseOrigin.y - closeButton.frame.origin.y
+        )
+
+        for buttonType in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+            guard let button = window.standardWindowButton(buttonType) else { continue }
+            button.setFrameOrigin(NSPoint(
+                x: button.frame.origin.x + offset.width,
+                y: button.frame.origin.y + offset.height
+            ))
+        }
     }
 
     static func installResizeCursorOverlay(in contentView: NSView, for window: NSWindow) {

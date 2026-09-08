@@ -20,9 +20,12 @@ mkdir -p "$APP_ROOT/Contents/MacOS" "$APP_ROOT/Contents/Resources"
 cp "$PROJECT_ROOT/Packaging/Info.plist" "$APP_ROOT/Contents/Info.plist"
 cp "$OUTPUT_ROOT/icon/AppIcon.icns" "$APP_ROOT/Contents/Resources/AppIcon.icns"
 
-for RESOURCE_BUNDLE in "$OUTPUT_ROOT/arm64/arm64-apple-macosx/release/"*.bundle; do
-  [[ -e "$RESOURCE_BUNDLE" ]] && cp -R "$RESOURCE_BUNDLE" "$APP_ROOT/Contents/Resources/"
-done
+APP_RESOURCE_BUNDLE="$OUTPUT_ROOT/arm64/arm64-apple-macosx/release/HelloX_HelloXApp.bundle"
+[[ -d "$APP_RESOURCE_BUNDLE" ]] || {
+  echo "Missing HelloX application resource bundle." >&2
+  exit 1
+}
+cp -R "$APP_RESOURCE_BUNDLE" "$APP_ROOT/Contents/Resources/"
 
 if [[ "$IDENTITY" == "-" ]]; then
   /usr/bin/codesign --force --deep --options runtime \

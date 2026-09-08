@@ -25,7 +25,6 @@ struct ShortcutRecorder: NSViewRepresentable {
 
 final class ShortcutRecorderView: NSView {
     private let clearHitWidth: CGFloat = 25
-    private let clearIconSize: CGFloat = 8
     private let clearTrailingInset: CGFloat = 7
     var binding: ShortcutBinding? {
         didSet {
@@ -40,12 +39,13 @@ final class ShortcutRecorderView: NSView {
     var onChange: ((ShortcutBinding?) -> Void)?
     private var isRecording = false
     private var pressedModifiers: UInt32 = 0
+    private var isPointerInside = false
     private var isPointerOverClear = false
     private var hoverTrackingArea: NSTrackingArea?
     private var outsideClickMonitor: Any?
 
     override var acceptsFirstResponder: Bool { true }
-    override var intrinsicContentSize: NSSize { NSSize(width: 152, height: 32) }
+    override var intrinsicContentSize: NSSize { NSSize(width: 90, height: HelloXTheme.minimumHitSize) }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
@@ -85,14 +85,17 @@ final class ShortcutRecorderView: NSView {
     }
 
     override func mouseEntered(with event: NSEvent) {
+        isPointerInside = true
         updatePointerLocation(event)
     }
 
     override func mouseMoved(with event: NSEvent) {
+        isPointerInside = true
         updatePointerLocation(event)
     }
 
     override func mouseExited(with event: NSEvent) {
+        isPointerInside = false
         isPointerOverClear = false
         needsDisplay = true
     }
@@ -161,18 +164,22 @@ final class ShortcutRecorderView: NSView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 16, yRadius: 16)
+        let path = NSBezierPath(
+            roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5),
+            xRadius: 8,
+            yRadius: 8
+        )
         let backgroundColor = isRecording
-            ? NSColor.controlAccentColor.withAlphaComponent(0.14)
+            ? NSColor(HelloXTheme.accent).withAlphaComponent(0.08)
             : recorderBackgroundColor
         backgroundColor.setFill()
         path.fill()
-        if hasConflict || isRecording {
-            let focusColor = hasConflict ? NSColor.systemRed : NSColor.controlAccentColor
-            focusColor.setStroke()
-            path.lineWidth = 1.25
-            path.stroke()
-        }
+        let borderColor = hasConflict
+            ? NSColor.systemRed
+            : (isRecording ? NSColor(HelloXTheme.accent) : recorderBorderColor)
+        borderColor.setStroke()
+        path.lineWidth = hasConflict || isRecording ? 1.25 : 1
+        path.stroke()
         let text: String
         if isRecording {
             let modifierText = ShortcutBinding(keyCode: UInt32.max, modifiers: pressedModifiers)
@@ -180,46 +187,36 @@ final class ShortcutRecorderView: NSView {
                 .replacingOccurrences(of: "键码 \(UInt32.max)", with: "")
             text = modifierText.isEmpty ? "请按组合键…" : modifierText
         } else {
-            text = binding?.displayName ?? "未设置"
+            text = binding.map { Self.spacedDisplayName($0.displayName) } ?? "未设置"
         }
         let attributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedSystemFont(ofSize: 12.5, weight: .medium),
-            .foregroundColor: NSColor.labelColor
+            .font: NSFont.monospacedSystemFont(
+                ofSize: 11,
+                weight: .semibold
+            ),
+            .foregroundColor: NSColor(HelloXTheme.primaryText(for: recorderScheme))
         ]
         let size = NSString(string: text).size(withAttributes: attributes)
-        let reservedClearWidth = binding == nil ? 0 : clearHitWidth + clearTrailingInset
+        let reservedClearWidth = showsClearAffordance ? clearHitWidth + clearTrailingInset : 0
         NSString(string: text).draw(
             at: CGPoint(x: max(10, (bounds.width - reservedClearWidth - size.width) / 2), y: (bounds.height - size.height) / 2),
             withAttributes: attributes
         )
         guard showsClearAffordance else { return }
 
-        let buttonRect = CGRect(
-            x: clearHitRect.midX - 9,
-            y: bounds.midY - 9,
-            width: 18,
-            height: 18
-        )
-        let buttonPath = NSBezierPath(ovalIn: buttonRect)
-        let buttonColor = isPointerOverClear
-            ? NSColor.secondaryLabelColor.withAlphaComponent(0.20)
-            : NSColor.secondaryLabelColor.withAlphaComponent(0.10)
-        buttonColor.setFill()
-        buttonPath.fill()
-        let iconRect = CGRect(
-            x: clearHitRect.midX - clearIconSize / 2,
-            y: bounds.midY - clearIconSize / 2,
-            width: clearIconSize,
-            height: clearIconSize
-        )
-        (isPointerOverClear ? NSColor.labelColor : NSColor.tertiaryLabelColor).setStroke()
-        let clearPath = NSBezierPath()
-        clearPath.move(to: iconRect.origin)
-        clearPath.line(to: CGPoint(x: iconRect.maxX, y: iconRect.maxY))
-        clearPath.move(to: CGPoint(x: iconRect.maxX, y: iconRect.minY))
-        clearPath.line(to: CGPoint(x: iconRect.minX, y: iconRect.maxY))
-        clearPath.lineWidth = 1.1
-        clearPath.stroke()
+        let buttonRect = CGRect(x: clearHitRect.midX - 9, y: bounds.midY - 9, width: 18, height: 18)
+        if isPointerOverClear {
+            NSColor(HelloXTheme.hoverBackground(for: recorderScheme)).setFill()
+            NSBezierPath(roundedRect: buttonRect, xRadius: 5, yRadius: 5).fill()
+        }
+        let iconSize: CGFloat = 14
+        let iconRect = CGRect(x: clearHitRect.midX - iconSize / 2,
+                              y: bounds.midY - iconSize / 2, width: iconSize, height: iconSize)
+        let iconColor = NSColor(isPointerOverClear
+            ? HelloXTheme.primaryText(for: recorderScheme)
+            : HelloXTheme.secondaryText(for: recorderScheme))
+        HelloXIconImages.tintedImage(for: .close, color: iconColor, size: iconSize)?.draw(in: iconRect)
+
     }
 
     private var clearHitRect: CGRect {
@@ -231,17 +228,14 @@ final class ShortcutRecorderView: NSView {
         )
     }
 
-    private var recorderBackgroundColor: NSColor {
-        let match = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua])
-        if match == .darkAqua {
-            return NSColor(calibratedRed: 20 / 255, green: 42 / 255, blue: 73 / 255, alpha: 0.90)
-        }
-        return NSColor(calibratedRed: 244 / 255, green: 247 / 255, blue: 251 / 255, alpha: 1)
-    }
+    private var recorderScheme: ColorScheme { HelloXAppearance.colorScheme(for: effectiveAppearance) }
+    private var recorderBackgroundColor: NSColor { NSColor(HelloXTheme.controlBackground(for: recorderScheme)) }
+    private var recorderBorderColor: NSColor { NSColor(HelloXTheme.border(for: recorderScheme)) }
 
     private var showsClearAffordance: Bool {
         binding != nil
             && !isRecording
+            && isPointerInside
     }
 
     private func updatePointerLocation(_ event: NSEvent) {
@@ -306,5 +300,19 @@ final class ShortcutRecorderView: NSView {
         if flags.contains(.control) { modifiers |= UInt32(controlKey) }
         if flags.contains(.shift) { modifiers |= UInt32(shiftKey) }
         return modifiers
+    }
+
+    private static func spacedDisplayName(_ displayName: String) -> String {
+        let modifierGlyphs: Set<Character> = ["⌃", "⌥", "⇧", "⌘"]
+        var components: [String] = []
+        var remainder = displayName[...]
+        while let first = remainder.first, modifierGlyphs.contains(first) {
+            components.append(String(first))
+            remainder.removeFirst()
+        }
+        if !remainder.isEmpty {
+            components.append(String(remainder))
+        }
+        return components.joined(separator: " ")
     }
 }

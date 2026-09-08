@@ -1,4 +1,5 @@
 import AppKit
+import ApplicationServices
 import HelloXCore
 import SwiftUI
 @preconcurrency import Translation
@@ -9,7 +10,15 @@ struct ManualScrollingCaptureContext {
 }
 
 enum ScrollingOverlayGeometry {
-    static let toolbarSize = CGSize(width: 186, height: 44)
+    // Keep the passthrough exclusion in sync with the real five-button
+    // scrolling toolbar. The old 186 x 44 approximation left part of the
+    // toolbar clickable through the overlay and blocked nearby content.
+    static var toolbarSize: CGSize {
+        CGSize(
+            width: CaptureToolbarLayout.buttonRowWidth(count: 5),
+            height: CaptureToolbarLayout.scrollingHeight + CaptureToolbarLayout.bottomInset
+        )
+    }
 
     static func toolbarFrame(selection: CGRect, in bounds: CGRect) -> CGRect {
         let size = CGSize(
@@ -106,15 +115,24 @@ enum MovableToolbarGeometry {
 enum CaptureToolbarLayout {
     static let scale: CGFloat = 1.25
     static let buttonSize = AnnotationPropertyBarLayout.toolbarButtonSize * scale
-    static let iconSize: CGFloat = 14 * scale * 1.25 * 0.75
+    static let iconSize: CGFloat = 16
     static let buttonSpacing = AnnotationPropertyBarLayout.toolbarButtonSpacing * scale
-    static let horizontalPadding = AnnotationPropertyBarLayout.toolbarHorizontalPadding * scale
+    static let edgeInset: CGFloat = 10
+    static let bottomInset: CGFloat = 3
+    static let horizontalPadding = edgeInset * 2
+    static let cornerRadius: CGFloat = 12
+    static let singleRowHeight: CGFloat = 62
+    static let wrappedRowsHeight: CGFloat = 102.5
+    static let scrollingHeight: CGFloat = 46
+    static let propertyRowHeight: CGFloat = 42
+    static let groupSeparatorWidth: CGFloat = 5
 
-    static func buttonRowWidth(count: Int) -> CGFloat {
+    static func buttonRowWidth(count: Int, includesGroupSeparator: Bool = false) -> CGFloat {
         guard count > 0 else { return horizontalPadding }
         return CGFloat(count) * buttonSize
             + CGFloat(count - 1) * buttonSpacing
             + horizontalPadding
+            + (includesGroupSeparator ? groupSeparatorWidth + buttonSpacing : 0)
     }
 }
 
@@ -155,9 +173,9 @@ private struct MovableToolbarContainer<Content: View>: View {
                 if enabled {
                     ZStack {
                         Color.clear
-                        Capsule()
-                            .fill(Color.secondary.opacity(0.42))
-                            .frame(width: 26, height: 3)
+                        HelloXIcon(icon: .line, size: 16)
+                            .foregroundStyle(HXTextStyle.secondary)
+                            .opacity(0.6)
                     }
                     .frame(width: 64, height: 12)
                     .contentShape(Rectangle())
@@ -172,7 +190,7 @@ private struct MovableToolbarContainer<Content: View>: View {
             .transaction { transaction in
                 if isDragging { transaction.animation = nil }
             }
-            .onChange(of: enabled) { isEnabled in
+            .onChange(of: enabled) { _, isEnabled in
                 guard !isEnabled else { return }
                 originOverride = nil
                 dragStartOrigin = nil
@@ -208,64 +226,79 @@ private struct MovableToolbarContainer<Content: View>: View {
     }
 }
 
-enum ScrollingWheelDirection {
-    static func resolve(deltaX: CGFloat, deltaY: CGFloat, usesHorizontalWheel: Bool) -> ScrollDirection? {
-        if usesHorizontalWheel {
-            // Mouse drivers may report Shift + wheel through either axis.
-            // Shift remains the explicit switch for horizontal capture.
-            let horizontalDelta = abs(deltaX) > abs(deltaY) ? deltaX : deltaY
-            guard abs(horizontalDelta) > 0.01 else { return nil }
-            return horizontalDelta < 0 ? .right : .left
-        }
-        guard abs(deltaY) > 0.01 else { return nil }
-        return deltaY < 0 ? .down : .up
-    }
-}
-
 @MainActor
 final class ManualScrollingCaptureModel: ObservableObject {
     @Published private(set) var isActive = false
+    @Published private(set) var isReady = false
     @Published private(set) var stitchedImage: CGImage?
     @Published private(set) var pixelHeight = 0
     @Published private(set) var pixelWidth = 0
     @Published private(set) var direction: ScrollDirection = .down
+    @Published private(set) var lastCaptureError: String?
 
     private var session: ManualScrollingCaptureSession?
     private var startTask: Task<Void, Never>?
     private var scheduledCaptureTask: Task<Void, Never>?
+    private var idleCaptureTask: Task<Void, Never>?
     private var scrollDirectionHint: ScrollDirection?
-    private var lastScrollEventDate: Date?
+    private var lastScrollDirectionHint: ScrollDirection?
+    private var hasPendingScrollIntent = false
+    private var pendingHorizontalDistance: CGFloat = 0
+    private var pendingVerticalDistance: CGFloat = 0
     private var firstPendingScrollEventDate: Date?
+    private var pendingCaptureWaitsForMovement = false
+    private var wheelIntent = ScrollingWheelIntentAccumulator()
     private var eventGeneration: UInt64 = 0
     private var processedEventGeneration: UInt64 = 0
     private var captureInFlight = false
 
-    // Keep consecutive source frames close enough to retain a real overlap
-    // during fast trackpad scrolling. A 280 ms batch could cross an entire
-    // chat viewport, after which the stitcher had no frame from which to
-    // recover and stopped appending.
-    private let idleCaptureDelay: TimeInterval = 0.07
-    private let maximumContinuousCaptureDelay: TimeInterval = 0.14
+    // Capture on the leading edge of a wheel burst. A trailing debounce lets
+    // fast trackpad motion cross most of a viewport before the first frame.
+    private let leadingCaptureDelay: TimeInterval = 0.018
+    private let idleFinalCaptureDelay: TimeInterval = 0.12
 
-    func noteScroll(deltaX: CGFloat, deltaY: CGFloat, usesHorizontalWheel: Bool) {
-        guard let direction = ScrollingWheelDirection.resolve(
+    var isPreparing: Bool { isActive && !isReady }
+
+    func noteScroll(
+        deltaX: CGFloat,
+        deltaY: CGFloat,
+        explicitHorizontalIntent: Bool,
+        timestamp: TimeInterval
+    ) {
+        guard isActive, isReady else { return }
+        guard let direction = wheelIntent.resolve(
             deltaX: deltaX,
             deltaY: deltaY,
-            usesHorizontalWheel: usesHorizontalWheel
+            explicitHorizontalIntent: explicitHorizontalIntent,
+            timestamp: timestamp
         ) else { return }
-        scrollDirectionHint = direction
+        let distance = max(abs(deltaX), abs(deltaY))
+        if direction.isHorizontal {
+            pendingHorizontalDistance += (direction == .right ? distance : -distance)
+        } else {
+            pendingVerticalDistance += (direction == .down ? distance : -distance)
+        }
+        hasPendingScrollIntent = true
+        scrollDirectionHint = pendingBatchDirection()
         let now = Date()
-        lastScrollEventDate = now
         if firstPendingScrollEventDate == nil {
             firstPendingScrollEventDate = now
         }
+        pendingCaptureWaitsForMovement = true
         eventGeneration &+= 1
         scheduleCaptureIfNeeded()
+        scheduleIdleFinalCapture()
     }
 
-    func begin(_ context: ManualScrollingCaptureContext) {
+    func begin(
+        _ context: ManualScrollingCaptureContext,
+        onReady: @escaping @MainActor () -> Void,
+        onFailure: @escaping @MainActor (String) -> Void
+    ) {
         guard !isActive else { return }
         isActive = true
+        isReady = false
+        lastCaptureError = nil
         let session = context.service.makeManualSession(target: context.target)
         self.session = session
         startTask = Task { @MainActor [weak self] in
@@ -275,11 +308,32 @@ final class ManualScrollingCaptureModel: ObservableObject {
                 // scrolling frame is requested.
                 await Task.yield()
                 self.apply(try await session.begin())
+                // Publish readiness and install event routing in the same
+                // MainActor turn. SwiftUI cannot render a ready state before
+                // wheel monitoring and passthrough are both installed.
+                self.isReady = true
+                onReady()
                 self.scheduleCaptureIfNeeded()
             } catch is CancellationError {
             } catch {
-                return
+                let message: String
+                if let helloXError = error as? HelloXError {
+                    message = helloXError.errorDescription ?? error.localizedDescription
+                } else {
+                    message = error.localizedDescription
+                }
+                self.lastCaptureError = message
+                // A failed initial ScreenCaptureKit request must not leave a
+                // fake active session with no wheel monitors installed.
+                self.session = nil
+                self.isReady = false
+                self.isActive = false
+                self.captureInFlight = false
+                self.firstPendingScrollEventDate = nil
+                self.pendingCaptureWaitsForMovement = false
+                onFailure(message)
             }
+            self.startTask = nil
         }
     }
 
@@ -288,32 +342,44 @@ final class ManualScrollingCaptureModel: ObservableObject {
             throw HelloXError.captureFailed("长截图尚未开始")
         }
         await startTask?.value
+        guard isReady else {
+            throw HelloXError.captureFailed(lastCaptureError ?? "长截图准备失败")
+        }
         return try await session.result()
     }
 
     func cancel() {
         startTask?.cancel()
         scheduledCaptureTask?.cancel()
+        idleCaptureTask?.cancel()
         startTask = nil
         scheduledCaptureTask = nil
+        idleCaptureTask = nil
         session = nil
         isActive = false
+        isReady = false
         captureInFlight = false
         firstPendingScrollEventDate = nil
+        pendingCaptureWaitsForMovement = false
+        wheelIntent.reset()
+        scrollDirectionHint = nil
+        lastScrollDirectionHint = nil
+        hasPendingScrollIntent = false
+        pendingHorizontalDistance = 0
+        pendingVerticalDistance = 0
+        eventGeneration = 0
+        processedEventGeneration = 0
+        lastCaptureError = nil
     }
 
     private func scheduleCaptureIfNeeded() {
-        guard isActive, session != nil, !captureInFlight,
+        guard isActive, isReady, session != nil, !captureInFlight,
               eventGeneration > processedEventGeneration,
               let firstPendingScrollEventDate,
-              let lastScrollEventDate else { return }
+              scheduledCaptureTask == nil else { return }
 
-        let deadline = min(
-            lastScrollEventDate.addingTimeInterval(idleCaptureDelay),
-            firstPendingScrollEventDate.addingTimeInterval(maximumContinuousCaptureDelay)
-        )
+        let deadline = firstPendingScrollEventDate.addingTimeInterval(leadingCaptureDelay)
         let delay = max(0, deadline.timeIntervalSinceNow)
-        scheduledCaptureTask?.cancel()
         scheduledCaptureTask = Task { @MainActor [weak self] in
             do {
                 try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
@@ -326,27 +392,68 @@ final class ManualScrollingCaptureModel: ObservableObject {
     }
 
     private func capturePendingScrollEvent() async {
-        guard isActive, !captureInFlight, let session,
+        guard isActive, isReady, !captureInFlight, let session,
               eventGeneration > processedEventGeneration else { return }
         scheduledCaptureTask = nil
         captureInFlight = true
         let attemptedGeneration = eventGeneration
-        let direction = scrollDirectionHint
+        let direction: ScrollDirection?
+        if hasPendingScrollIntent {
+            direction = scrollDirectionHint
+            if let direction {
+                lastScrollDirectionHint = direction
+            }
+        } else {
+            direction = lastScrollDirectionHint
+        }
+        let waitsForMovement = pendingCaptureWaitsForMovement
         // Events arriving while the screenshot is being captured form the next batch.
         firstPendingScrollEventDate = nil
+        pendingCaptureWaitsForMovement = false
+        scrollDirectionHint = nil
+        hasPendingScrollIntent = false
+        pendingHorizontalDistance = 0
+        pendingVerticalDistance = 0
         defer {
             processedEventGeneration = max(processedEventGeneration, attemptedGeneration)
             captureInFlight = false
             scheduleCaptureIfNeeded()
         }
         do {
-            if let update = try await session.captureCurrentFrame(directionHint: direction) {
+            if let update = try await session.captureCurrentFrame(
+                directionHint: direction,
+                waitsForMovement: waitsForMovement
+            ) {
+                lastCaptureError = nil
                 apply(update)
             }
         } catch is CancellationError {
         } catch {
-            // A later wheel event gets a fresh attempt. Avoid retrying the same
-            // event forever, which previously produced duplicate settling frames.
+            if let helloXError = error as? HelloXError {
+                lastCaptureError = helloXError.errorDescription
+            } else {
+                lastCaptureError = error.localizedDescription
+            }
+        }
+    }
+
+    private func scheduleIdleFinalCapture() {
+        idleCaptureTask?.cancel()
+        idleCaptureTask = Task { @MainActor [weak self] in
+            do {
+                guard let self else { return }
+                try await Task.sleep(nanoseconds: UInt64(idleFinalCaptureDelay * 1_000_000_000))
+                guard !Task.isCancelled, isActive, isReady, session != nil else { return }
+                idleCaptureTask = nil
+                wheelIntent.reset()
+                eventGeneration &+= 1
+                if firstPendingScrollEventDate == nil {
+                    firstPendingScrollEventDate = Date().addingTimeInterval(-leadingCaptureDelay)
+                }
+                scheduleCaptureIfNeeded()
+            } catch is CancellationError {
+            } catch {
+            }
         }
     }
 
@@ -357,10 +464,23 @@ final class ManualScrollingCaptureModel: ObservableObject {
         direction = update.direction
     }
 
+    private func pendingBatchDirection() -> ScrollDirection? {
+        let horizontalMagnitude = abs(pendingHorizontalDistance)
+        let verticalMagnitude = abs(pendingVerticalDistance)
+        if horizontalMagnitude > verticalMagnitude {
+            guard horizontalMagnitude > 0 else { return nil }
+            return pendingHorizontalDistance > 0 ? .right : .left
+        }
+        guard verticalMagnitude > 0 else { return nil }
+        return pendingVerticalDistance > 0 ? .down : .up
+    }
+
 }
 
 @MainActor
 final class CaptureOverlayEditorController: NSWindowController {
+    private static let forwardedScrollEventMarker: Int64 = 0x48454C4C4F58
+
     let editorDocument: EditorDocument
     var onClose: (() -> Void)?
     var onPin: ((CGImage, CGRect) -> Void)?
@@ -380,6 +500,10 @@ final class CaptureOverlayEditorController: NSWindowController {
     private var passthroughTimer: Timer?
     private var scrollingWheelMonitor: Any?
     private var localScrollingWheelMonitor: Any?
+    private var scrollingPointerMonitor: Any?
+    private var localScrollingPointerMonitor: Any?
+    private var scrollingTargetProcessID: pid_t?
+    private var scrollingTargetCaptureRect: CGRect?
     private var finished = false
     private let startsScrolling: Bool
     private let scrollingModel = ManualScrollingCaptureModel()
@@ -443,7 +567,7 @@ final class CaptureOverlayEditorController: NSWindowController {
             onPin: { [weak self] in self?.pin() },
             onOCR: { [weak self] in self?.recognizeText() },
             onQRCode: { [weak self] in self?.recognizeQRCode() },
-            onTranslate: { [weak self] in self?.translate() },
+            onTranslate: { [weak self] in self?.translateScreenshot() },
             onBeginScrolling: { [weak self] in self?.beginScrolling() }
         )
         let hostingView = NSHostingView(rootView: rootView)
@@ -518,6 +642,7 @@ final class CaptureOverlayEditorController: NSWindowController {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         panel.hasShadow = false
         panel.isMovable = false
+        panel.acceptsMouseMovedEvents = interactive
         panel.ignoresMouseEvents = !interactive
         panel.hidesOnDeactivate = false
         panel.isReleasedWhenClosed = false
@@ -548,8 +673,7 @@ final class CaptureOverlayEditorController: NSWindowController {
         if editorDocument.outputCrop != crop {
             editorDocument.outputCrop = crop
             editorDocument.ocrResult = nil
-            editorDocument.translatedText = nil
-            editorDocument.imageTranslationBlocks = []
+            editorDocument.clearScreenshotTranslation()
         }
     }
 
@@ -739,42 +863,117 @@ final class CaptureOverlayEditorController: NSWindowController {
         }
     }
 
-    private func translate() {
-        editorDocument.translateImageInPlace()
+    private func translateScreenshot() {
+        editorDocument.toggleScreenshotTranslation()
     }
 
     private func beginScrolling() {
         guard !scrollingModel.isActive else { return }
+        editorDocument.exportError = nil
         let globalFrame = Self.globalAppKitRect(currentSelection, on: targetScreen)
         guard let context = makeScrollingContext?(globalFrame) else {
             editorDocument.exportError = "找不到需要滚动的目标应用"
             NSSound.beep()
             return
         }
-        scrollingModel.begin(context)
-        startScrollingPassthrough()
+        scrollingModel.begin(
+            context,
+            onReady: { [weak self] in
+                self?.startScrollingPassthrough(target: context.target)
+            },
+            onFailure: { [weak self] message in
+                self?.stopScrollingPassthrough()
+                self?.editorDocument.exportError = message
+                NSSound.beep()
+            }
+        )
     }
 
-    private func startScrollingPassthrough() {
+    private func startScrollingPassthrough(target: HelloXCore.ScrollTarget) {
         stopScrollingPassthrough()
+        scrollingTargetProcessID = target.processID
+        scrollingTargetCaptureRect = target.captureRect
         let handleWheel: (NSEvent) -> Void = { [weak self] event in
-            let deltaX = event.scrollingDeltaX
-            let deltaY = event.scrollingDeltaY
-            let usesHorizontalWheel = event.modifierFlags.contains(.shift)
-            Task { @MainActor [weak self] in
-                self?.scrollingModel.noteScroll(
+            let rawDeltaX = event.scrollingDeltaX
+            let rawDeltaY = event.scrollingDeltaY
+            let explicitHorizontalIntent = event.modifierFlags.contains(.shift)
+            // Some mouse drivers report an ordinary vertical wheel through X.
+            // Preserve that compatibility while allowing precise trackpad X
+            // motion to participate in axis accumulation.
+            let deltaX: CGFloat
+            let deltaY: CGFloat
+            if !explicitHorizontalIntent, !event.hasPreciseScrollingDeltas {
+                deltaX = 0
+                deltaY = abs(rawDeltaY) >= 0.18 ? rawDeltaY : rawDeltaX
+            } else {
+                deltaX = rawDeltaX
+                deltaY = rawDeltaY
+            }
+            let timestamp = event.timestamp
+            let eventLocation = event.cgEvent?.location
+            // NSEvent monitor callbacks are delivered on the main thread.
+            // Handle the event synchronously and use the event's frozen Quartz
+            // location so later pointer movement cannot retroactively accept
+            // or reject this wheel sample.
+            MainActor.assumeIsolated {
+                guard let self,
+                      self.shouldCaptureScrollingEvent(at: eventLocation) else { return }
+                self.scrollingModel.noteScroll(
                     deltaX: deltaX,
                     deltaY: deltaY,
-                    usesHorizontalWheel: usesHorizontalWheel
+                    explicitHorizontalIntent: explicitHorizontalIntent,
+                    timestamp: timestamp
                 )
             }
         }
-        localScrollingWheelMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { event in
-            handleWheel(event)
+        localScrollingWheelMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+            guard let self else { return event }
+            // If the pointer entered the capture region immediately before
+            // this wheel event, AppKit may still have routed the event to the
+            // overlay using the previous hit-test state. Forward that one
+            // event to the target process so the first wheel tick is not lost.
+            if self.shouldPassScrollingMouseEvents(),
+               let targetProcessID = self.scrollingTargetProcessID,
+               AXIsProcessTrusted(),
+               CGPreflightPostEventAccess(),
+               let cgEvent = event.cgEvent {
+                self.targetPanel.ignoresMouseEvents = true
+                cgEvent.setIntegerValueField(
+                    .eventSourceUserData,
+                    value: Self.forwardedScrollEventMarker
+                )
+                cgEvent.postToPid(targetProcessID)
+                handleWheel(event)
+                return nil
+            }
+            // Toolbar and preview scrolling remains local and must not create
+            // a phantom capture for content that never moved.
             return event
         }
         scrollingWheelMonitor = NSEvent.addGlobalMonitorForEvents(matching: .scrollWheel) { event in
+            if event.cgEvent?.getIntegerValueField(.eventSourceUserData)
+                == Self.forwardedScrollEventMarker {
+                return
+            }
             handleWheel(event)
+        }
+        let pointerEvents: NSEvent.EventTypeMask = [
+            .mouseMoved,
+            .leftMouseDragged,
+            .rightMouseDragged,
+            .otherMouseDragged
+        ]
+        let handlePointerMovement: (NSEvent) -> Void = { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.updateScrollingPassthrough()
+            }
+        }
+        localScrollingPointerMonitor = NSEvent.addLocalMonitorForEvents(matching: pointerEvents) { event in
+            handlePointerMovement(event)
+            return event
+        }
+        scrollingPointerMonitor = NSEvent.addGlobalMonitorForEvents(matching: pointerEvents) { event in
+            handlePointerMovement(event)
         }
         updateScrollingPassthrough()
         let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
@@ -785,22 +984,31 @@ final class CaptureOverlayEditorController: NSWindowController {
     }
 
     private func updateScrollingPassthrough() {
-        guard scrollingModel.isActive else {
-            targetPanel.ignoresMouseEvents = false
-            return
-        }
+        targetPanel.ignoresMouseEvents = shouldPassScrollingMouseEvents()
+    }
+
+    private func shouldPassScrollingMouseEvents() -> Bool {
+        guard scrollingModel.isActive, scrollingModel.isReady else { return false }
         let pointer = NSEvent.mouseLocation
         let localPoint = CGPoint(
             x: pointer.x - targetScreen.frame.minX,
             y: targetScreen.frame.maxY - pointer.y
         )
         let bounds = CGRect(origin: .zero, size: targetScreen.frame.size)
-        targetPanel.ignoresMouseEvents = ScrollingOverlayGeometry.shouldPassMouseEvents(
+        return ScrollingOverlayGeometry.shouldPassMouseEvents(
             at: localPoint,
             selection: currentSelection,
             in: bounds,
             direction: scrollingModel.direction
         )
+    }
+
+    private func shouldCaptureScrollingEvent(at eventLocation: CGPoint?) -> Bool {
+        guard scrollingModel.isActive,
+              scrollingModel.isReady,
+              let eventLocation,
+              let scrollingTargetCaptureRect else { return false }
+        return scrollingTargetCaptureRect.contains(eventLocation)
     }
 
     private func stopScrollingPassthrough() {
@@ -814,6 +1022,16 @@ final class CaptureOverlayEditorController: NSWindowController {
             NSEvent.removeMonitor(localScrollingWheelMonitor)
             self.localScrollingWheelMonitor = nil
         }
+        if let scrollingPointerMonitor {
+            NSEvent.removeMonitor(scrollingPointerMonitor)
+            self.scrollingPointerMonitor = nil
+        }
+        if let localScrollingPointerMonitor {
+            NSEvent.removeMonitor(localScrollingPointerMonitor)
+            self.localScrollingPointerMonitor = nil
+        }
+        scrollingTargetProcessID = nil
+        scrollingTargetCaptureRect = nil
         targetPanel.ignoresMouseEvents = false
     }
 
@@ -892,6 +1110,8 @@ private struct CaptureOverlayEditorView: View {
     @State private var mosaicMode: MosaicMode = .brush
     @State private var mosaicBlockSize: Double = 10
     @State private var watermarkSpacing: Double = 48
+    @State private var highlightShowsBorder = false
+    @State private var highlightShape: AnnotationHighlightShape = .rectangle
     @State private var textValue = "文字"
     @State private var draft: Annotation?
     @State private var dragStart: CGPoint?
@@ -900,15 +1120,21 @@ private struct CaptureOverlayEditorView: View {
     @State private var selectedAnnotationID: UUID?
     @State private var selectedAnnotationDraft: Annotation?
     @State private var originalSelectedAnnotation: Annotation?
+    @State private var resizeOriginalAnnotation: Annotation?
     @State private var originalSelection: CGRect?
     @State private var propertyEditRegistered = false
     @State private var hoveredToolbarHelp: String?
     @State private var isEditingText = false
     @State private var didMoveSelectedText = false
+    @State private var editsSelectedStepTextOnRelease = false
+    @State private var isDraggingStepBadge = false
+    @State private var isDraggingStepCard = false
+    @State private var hoveredAnnotationID: UUID?
+    @State private var isAnnotationSelectionInteraction = false
     @State private var inlineTextBuffer = InlineAnnotationTextBuffer()
     @State private var mosaicCache = MosaicPreviewCache()
     @State private var interactionThrottle = AnnotationInteractionThrottle()
-    @State private var imageTranslationConfiguration: TranslationSession.Configuration?
+    @State private var screenshotTranslationConfiguration: TranslationSession.Configuration?
 
     init(
         document: EditorDocument,
@@ -959,6 +1185,18 @@ private struct CaptureOverlayEditorView: View {
                         .contentShape(Rectangle())
                         .gesture(annotationGesture)
                 }
+                AnnotationInteractionEventView(
+                    hitTarget: { point in
+                        guard !scrollingModel.isActive,
+                              tool != .watermark,
+                              tool != .pixelate,
+                              !isEditingText else { return nil }
+                        return hitAnnotation(at: point)?.id
+                    },
+                    onHoverTargetChange: { hoveredAnnotationID = $0 },
+                    onDelete: deleteSelectedAnnotation
+                )
+                .frame(width: proxy.size.width, height: proxy.size.height)
                 dimMask(screenBounds)
                     .allowsHitTesting(false)
 
@@ -967,8 +1205,8 @@ private struct CaptureOverlayEditorView: View {
                 }
                 selectedTextBorder
                 inlineTextEditor
+                annotationResizeHandles
                 if !scrollingModel.isActive {
-                    sizeLabel
                     selectionHandles(bounds: selectionBounds)
                 }
                 toolbar(in: screenBounds)
@@ -989,22 +1227,22 @@ private struct CaptureOverlayEditorView: View {
                 DispatchQueue.main.async { translate() }
             }
         }
-        .onChange(of: tool) { newTool in
+        .onChange(of: tool) { _, newTool in
             guard newTool == .pixelate else { return }
             _ = mosaicCache.image(for: document.image, blockSize: mosaicBlockSize)
         }
-        .onChange(of: mosaicBlockSize) { value in
+        .onChange(of: mosaicBlockSize) { _, value in
             guard tool == .pixelate else { return }
             _ = mosaicCache.image(for: document.image, blockSize: value)
         }
-        .onChange(of: scrollingModel.isActive) { active in
+        .onChange(of: scrollingModel.isActive) { _, active in
             if active { hoveredToolbarHelp = nil }
         }
-        .onChange(of: document.pendingImageTranslationRequest?.id) { _ in
-            requestOfflineImageTranslation()
+        .onChange(of: document.pendingScreenshotTranslationRequest?.id) {
+            requestOfflineScreenshotTranslation()
         }
-        .translationTask(imageTranslationConfiguration) { session in
-            guard let request = document.pendingImageTranslationRequest else { return }
+        .translationTask(screenshotTranslationConfiguration) { session in
+            guard let request = document.pendingScreenshotTranslationRequest else { return }
             do {
                 let availability = LanguageAvailability()
                 let target = Locale.Language(identifier: request.targetLanguageIdentifier)
@@ -1015,30 +1253,35 @@ private struct CaptureOverlayEditorView: View {
                         to: target
                     )
                 } else {
-                    status = try await availability.status(
-                        for: request.paragraphs.map(\.text).joined(separator: "\n\n"),
-                        to: target
-                    )
+                    let sample = request.paragraphs
+                        .map { ScreenshotTranslationContentPolicy.textForTranslation($0.text) }
+                        .joined(separator: "\n")
+                    status = try await availability.status(for: sample, to: target)
                 }
                 guard status != .unsupported else { throw HelloXError.languageNotSupported }
-                if status == .supported {
-                    try await session.prepareTranslation()
-                }
-                var translations: [String] = []
+                if status == .supported { try await session.prepareTranslation() }
+
+                var translations: [UUID: String] = [:]
+                translations.reserveCapacity(request.paragraphs.count)
                 for paragraph in request.paragraphs {
-                    let response = try await session.translate(paragraph.text)
-                    translations.append(response.targetText)
+                    try Task.checkCancellation()
+                    let protected = ScreenshotTranslationContentPolicy.protectedText(
+                        ScreenshotTranslationContentPolicy.textForTranslation(paragraph.text)
+                    )
+                    let response = try await session.translate(protected.text)
+                    translations[paragraph.id] = protected.restoring(in: response.targetText)
                 }
-                document.completeOfflineImageTranslation(
+                try Task.checkCancellation()
+                document.completeOfflineScreenshotTranslation(
                     requestID: request.id,
-                    texts: translations,
+                    translations: translations,
                     errorMessage: nil
                 )
             } catch is CancellationError {
             } catch {
-                document.completeOfflineImageTranslation(
+                document.completeOfflineScreenshotTranslation(
                     requestID: request.id,
-                    texts: nil,
+                    translations: nil,
                     errorMessage: TranslationWindowModel.offlineMessage(for: error)
                 )
             }
@@ -1046,67 +1289,84 @@ private struct CaptureOverlayEditorView: View {
     }
 
     private var previewCanvas: some View {
-        ZStack(alignment: .topLeading) {
+        let physicalScale = imageFrame.width * document.displayScale / max(1, CGFloat(document.image.width))
+        return ZStack(alignment: .topLeading) {
+            // The editor frame is already expressed in screen points. Passing
+            // the capture's backing scale here makes SwiftUI reinterpret the
+            // CGImage inside the transparent overlay and can produce a blank
+            // layer on Retina displays. Keep the preview's image scale neutral.
             Image(decorative: document.image, scale: 1)
                 .resizable()
-                .interpolation(.none)
+                .interpolation(abs(physicalScale - 1) < 0.02 ? .none : .high)
                 .frame(width: imageFrame.width, height: imageFrame.height)
                 .position(x: imageFrame.midX, y: imageFrame.midY)
                 .allowsHitTesting(false)
+            if document.showsScreenshotTranslation {
+                if let reconstructedBackground = document.screenshotTranslationBackgroundImage {
+                    Image(decorative: reconstructedBackground, scale: 1)
+                        .resizable()
+                        .interpolation(abs(physicalScale - 1) < 0.02 ? .none : .high)
+                        .frame(width: selection.width, height: selection.height)
+                        .position(x: selection.midX, y: selection.midY)
+                        .allowsHitTesting(false)
+                }
+                ScreenshotTranslationCanvasOverlay(
+                    blocks: document.screenshotTranslationBlocks,
+                    selection: selection,
+                    sourceImageSize: document.screenshotTranslationBackgroundImage.map {
+                        CGSize(width: $0.width, height: $0.height)
+                    } ?? CGSize(
+                        width: CGFloat(document.image.width) * selection.width / max(1, imageFrame.width),
+                        height: CGFloat(document.image.height) * selection.height / max(1, imageFrame.height)
+                    )
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .allowsHitTesting(false)
+            }
             Canvas { context, _ in
                 context.clip(to: Path(selection))
-                for annotation in document.annotations where annotation.id != selectedAnnotationID {
-                    draw(annotation, context: &context)
+                var stepNumber = 0
+                for annotation in document.annotations {
+                    if annotation.tool == .step { stepNumber += 1 }
+                    guard annotation.id != selectedAnnotationID else { continue }
+                    draw(
+                        annotation,
+                        stepNumber: annotation.tool == .step ? stepNumber : nil,
+                        context: &context
+                    )
                 }
-                if document.imageTranslationBlocks.isEmpty {
-                    for block in document.ocrResult?.blocks ?? [] {
-                        let rect = CGRect(
-                            x: selection.minX + block.boundingBox.minX * selection.width,
-                            y: selection.minY + (1 - block.boundingBox.maxY) * selection.height,
-                            width: block.boundingBox.width * selection.width,
-                            height: block.boundingBox.height * selection.height
-                        )
-                        context.fill(Path(rect), with: .color(.yellow.opacity(0.12)))
-                        context.stroke(Path(rect), with: .color(.yellow.opacity(0.8)), lineWidth: 1)
-                    }
+                for block in document.hasScreenshotTranslation ? [] : (document.ocrResult?.blocks ?? []) {
+                    let rect = CGRect(
+                        x: selection.minX + block.boundingBox.minX * selection.width,
+                        y: selection.minY + (1 - block.boundingBox.maxY) * selection.height,
+                        width: block.boundingBox.width * selection.width,
+                        height: block.boundingBox.height * selection.height
+                    )
+                    context.fill(Path(rect), with: .color(.yellow.opacity(0.12)))
+                    context.stroke(Path(rect), with: .color(.yellow.opacity(0.8)), lineWidth: 1)
                 }
             }
             .allowsHitTesting(false)
             .drawingGroup(opaque: false, colorMode: .linear)
-            ImageTranslationCanvasOverlay(
-                blocks: document.imageTranslationBlocks,
-                selection: selection,
-                sourceImageSize: CGSize(
-                    width: CGFloat(document.image.width) * selection.width / max(1, imageFrame.width),
-                    height: CGFloat(document.image.height) * selection.height / max(1, imageFrame.height)
-                )
-            )
-            .allowsHitTesting(false)
             Canvas { context, _ in
                 context.clip(to: Path(selection))
-                if let draft { draw(draft, context: &context) }
+                if let draft { draw(draft, stepNumber: nil, context: &context) }
                 if let selectedAnnotationDraft,
-                   !(isEditingText && selectedAnnotationDraft.tool == .text) {
-                    draw(selectedAnnotationDraft, context: &context)
+                   !(isEditingText && selectedAnnotationDraft.tool.isTextual) {
+                    draw(
+                        selectedAnnotationDraft,
+                        stepNumber: StepAnnotationNumbering.number(
+                            for: selectedAnnotationDraft.id,
+                            in: document.annotations
+                        ),
+                        context: &context
+                    )
                 }
             }
             .allowsHitTesting(false)
         }
     }
 
-    private func requestOfflineImageTranslation() {
-        guard let request = document.pendingImageTranslationRequest else { return }
-        let source = request.sourceLanguageIdentifier.map(Locale.Language.init(identifier:))
-        let target = Locale.Language(identifier: request.targetLanguageIdentifier)
-        if var configuration = imageTranslationConfiguration,
-           configuration.source == source,
-           configuration.target == target {
-            configuration.invalidate()
-            imageTranslationConfiguration = configuration
-        } else {
-            imageTranslationConfiguration = TranslationSession.Configuration(source: source, target: target)
-        }
-    }
 
     private func dimMask(_ bounds: CGRect) -> some View {
         Canvas { context, _ in
@@ -1123,7 +1383,8 @@ private struct CaptureOverlayEditorView: View {
 
     private var selectionBorder: some View {
         Rectangle()
-            .stroke(HelloXTheme.accent, lineWidth: 2)
+            .stroke(Color.white.opacity(0.88), lineWidth: 4)
+            .overlay(Rectangle().stroke(HelloXTheme.accent, lineWidth: 2))
             .frame(width: selection.width, height: selection.height)
             .position(x: selection.midX, y: selection.midY)
             .allowsHitTesting(false)
@@ -1132,7 +1393,7 @@ private struct CaptureOverlayEditorView: View {
     @ViewBuilder
     private var selectedTextBorder: some View {
         if let annotation = selectedAnnotationDraft,
-           !(isEditingText && annotation.tool == .text) {
+           !(isEditingText && annotation.tool.isTextual) {
             let rect = AnnotationEditingGeometry.displayBounds(
                 for: annotation,
                 imageRect: imageFrame,
@@ -1149,30 +1410,58 @@ private struct CaptureOverlayEditorView: View {
         }
     }
 
-    private var sizeLabel: some View {
-        let width = Int((selection.width / max(1, imageFrame.width)) * CGFloat(document.image.width))
-        let height = Int((selection.height / max(1, imageFrame.height)) * CGFloat(document.image.height))
-        return Text("\(width) × \(height)")
-            .font(.system(size: 13, weight: .semibold, design: .monospaced))
-            .foregroundStyle(.white)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            .background(HelloXTheme.accent.opacity(0.96), in: RoundedRectangle(cornerRadius: HelloXTheme.compactRadius, style: .continuous))
-            .position(
-                x: selection.minX + 54,
-                y: selection.minY > 34 ? selection.minY - 17 : selection.minY + 18
-            )
-            .allowsHitTesting(false)
+    @ViewBuilder
+    private var annotationResizeHandles: some View {
+        if !scrollingModel.isActive,
+           let annotation = selectedAnnotationDraft,
+           AnnotationInlineEditingPolicy.showsResizeHandles(
+               for: annotation.tool,
+               isEditingText: isEditingText
+           ) {
+            ForEach(AnnotationEditingGeometry.resizeHandles(for: annotation)) { handle in
+                AnnotationResizeHandleView(
+                    handle: handle,
+                    position: AnnotationEditingGeometry.resizeHandlePosition(
+                        handle,
+                        for: annotation,
+                        imageRect: imageFrame,
+                        sourceImageSize: sourceImageSize
+                    ),
+                    onChanged: { translation in
+                        if resizeOriginalAnnotation == nil { resizeOriginalAnnotation = annotation }
+                        guard let original = resizeOriginalAnnotation else { return }
+                        selectedAnnotationDraft = AnnotationEditingGeometry.resized(
+                            original,
+                            handle: handle,
+                            by: translation,
+                            imageRect: imageFrame,
+                            editingBounds: selection,
+                            sourceImageSize: sourceImageSize
+                        )
+                    },
+                    onEnded: {
+                        if selectedAnnotationDraft != nil, resizeOriginalAnnotation != nil {
+                            commitSelectedAnnotation()
+                        }
+                        resizeOriginalAnnotation = nil
+                        propertyEditRegistered = false
+                    }
+                )
+            }
+        }
     }
 
     @ViewBuilder
     private func selectionHandles(bounds: CGRect) -> some View {
-        ForEach(SelectionHandle.allCases, id: \.rawValue) { handle in
-            SelectionResizeHandle(
-                handle: handle,
-                selection: selectionBinding,
-                bounds: bounds
-            )
+        if !document.isScreenshotTranslationSelectionLocked {
+            ForEach(SelectionHandle.allCases, id: \.rawValue) { handle in
+                SelectionResizeHandle(
+                    handle: handle,
+                    selection: selectionBinding,
+                    bounds: bounds,
+                    onEnded: commitSelectionChange
+                )
+            }
         }
     }
 
@@ -1180,10 +1469,15 @@ private struct CaptureOverlayEditorView: View {
         Binding(
             get: { selection },
             set: { value in
+                guard !document.isScreenshotTranslationSelectionLocked else { return }
                 selection = value
-                onSelectionChange(value)
             }
         )
+    }
+
+    private func commitSelectionChange() {
+        guard !document.isScreenshotTranslationSelectionLocked else { return }
+        onSelectionChange(selection)
     }
 
     private func toolbar(in bounds: CGRect) -> some View {
@@ -1191,19 +1485,23 @@ private struct CaptureOverlayEditorView: View {
         let propertyTool = selectedAnnotationDraft?.tool ?? tool
         let availableWidth = max(132, bounds.width - 24)
         let mainButtonCount = scrollingModel.isActive ? 5 : toolbarTools.count + 10
-        let mainRowWidth = CaptureToolbarLayout.buttonRowWidth(count: mainButtonCount)
+        let mainRowWidth = CaptureToolbarLayout.buttonRowWidth(
+            count: mainButtonCount, includesGroupSeparator: !scrollingModel.isActive
+        )
         let wrapsControls = !scrollingModel.isActive && mainRowWidth > availableWidth
         let wrappedRowWidth = max(
             CaptureToolbarLayout.buttonRowWidth(count: toolbarTools.count + 1),
             CaptureToolbarLayout.buttonRowWidth(count: 9)
         )
         let propertyWidth = propertyVisible
-            ? AnnotationPropertyBarLayout.propertyContentWidth(for: propertyTool)
+            ? AnnotationPropertyBarLayout.propertyContentWidth(for: propertyTool) + CaptureToolbarLayout.horizontalPadding
             : 0
         let preferredWidth = max(wrapsControls ? wrappedRowWidth : mainRowWidth, propertyWidth)
         let toolbarWidth = min(preferredWidth, availableWidth)
-        let controlsHeight: CGFloat = scrollingModel.isActive ? 55 : (wrapsControls ? 102.5 : 65)
-        let toolbarHeight = controlsHeight + (propertyVisible ? 46 : 0)
+        let controlsHeight = scrollingModel.isActive ? CaptureToolbarLayout.scrollingHeight
+            : (wrapsControls ? CaptureToolbarLayout.wrappedRowsHeight : CaptureToolbarLayout.singleRowHeight)
+        let toolbarHeight = controlsHeight + (propertyVisible ? CaptureToolbarLayout.propertyRowHeight : 0)
+            + CaptureToolbarLayout.bottomInset
         let toolbarSize = CGSize(width: toolbarWidth, height: toolbarHeight)
         let defaultOrigin = SelectionGeometry.toolbarOrigin(selection: selection, toolbarSize: toolbarSize, within: bounds)
         return MovableToolbarContainer(
@@ -1213,10 +1511,23 @@ private struct CaptureOverlayEditorView: View {
             enabled: !scrollingModel.isActive,
             onDragBegan: { hoveredToolbarHelp = nil }
         ) { origin in
-            VStack(spacing: 6) {
+            VStack(spacing: 4) {
+                if !scrollingModel.isActive {
+                    HStack {
+                        Text(captureSizeDescription)
+                            .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
+                            .lineLimit(1)
+                        Spacer(minLength: 0)
+                    }
+                    .frame(height: 14)
+                    .padding(.horizontal, CaptureToolbarLayout.edgeInset)
+                    .padding(.top, 4)
+                    .allowsHitTesting(false)
+                }
+
                 toolbarControls(wrapped: wrapsControls)
-                    .padding(.horizontal, 9)
-                    .padding(.top, scrollingModel.isActive ? 0 : 10)
+                    .padding(.horizontal, CaptureToolbarLayout.edgeInset)
 
                 if propertyVisible {
                     AnnotationPropertyBar(
@@ -1226,38 +1537,46 @@ private struct CaptureOverlayEditorView: View {
                         mosaicMode: propertyMosaicModeBinding,
                         mosaicBlockSize: propertyMosaicBlockSizeBinding,
                         text: propertyTextBinding,
-                        watermarkSpacing: propertyWatermarkSpacingBinding
+                        watermarkSpacing: propertyWatermarkSpacingBinding,
+                        highlightShowsBorder: propertyHighlightShowsBorderBinding,
+                        highlightShape: propertyHighlightShapeBinding
                     )
-                    .padding(.horizontal, 7)
-                    .padding(.bottom, 5)
+                    .padding(.horizontal, CaptureToolbarLayout.edgeInset)
+                    .padding(.bottom, 3)
                 }
             }
+            .padding(.bottom, CaptureToolbarLayout.bottomInset)
             .frame(width: toolbarWidth, height: toolbarHeight)
             .background {
-                Color(red: 0.97, green: 0.98, blue: 0.99)
-                .clipShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
+                HelloXTheme.surface(for: colorScheme)
+                    .opacity(0.97)
+                    .clipShape(RoundedRectangle(cornerRadius: CaptureToolbarLayout.cornerRadius, style: .continuous))
             }
-            .overlay(RoundedRectangle(cornerRadius: 15).stroke(HelloXTheme.border(for: colorScheme)))
-            .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.32 : 0.16), radius: 18, y: 8)
+            .overlay(RoundedRectangle(cornerRadius: CaptureToolbarLayout.cornerRadius).stroke(HelloXTheme.border(for: colorScheme)))
+            .shadow(color: .black.opacity(0.20), radius: 12, y: 4)
             .overlay(alignment: .top) {
                 if let hoveredToolbarHelp {
                     Text(hoveredToolbarHelp)
                         .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(colorScheme == .dark ? Color.white : HelloXTheme.primaryText(for: colorScheme))
+                        .foregroundStyle(HelloXTheme.primaryText(for: colorScheme))
                         .padding(.horizontal, 10)
                         .frame(height: 26)
                         .background(
-                            colorScheme == .dark
-                                ? Color(red: 0.08, green: 0.13, blue: 0.22).opacity(0.96)
-                                : Color.white.opacity(0.98),
+                            HelloXTheme.controlBackground(for: colorScheme).opacity(0.98),
                             in: Capsule()
                         )
-                        .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.30 : 0.16), radius: 8, y: 3)
+                        .shadow(color: HelloXTheme.shadow(for: colorScheme), radius: 8, y: 3)
                         .offset(y: origin.y < 38 ? toolbarHeight + 7 : -33)
                         .allowsHitTesting(false)
                 }
             }
         }
+    }
+
+    private var captureSizeDescription: String {
+        let width = Int((selection.width / max(1, imageFrame.width)) * CGFloat(document.image.width))
+        let height = Int((selection.height / max(1, imageFrame.height)) * CGFloat(document.image.height))
+        return "\(width) × \(height) px"
     }
 
     @ViewBuilder
@@ -1279,6 +1598,10 @@ private struct CaptureOverlayEditorView: View {
         } else {
             HStack(spacing: CaptureToolbarLayout.buttonSpacing) {
                 annotationToolbarControls
+                Rectangle()
+                    .fill(HelloXTheme.border(for: colorScheme))
+                    .frame(width: 1, height: 22)
+                    .frame(width: CaptureToolbarLayout.groupSeparatorWidth)
                 outputToolbarControls
             }
             .frame(height: CaptureToolbarLayout.buttonSize)
@@ -1307,7 +1630,14 @@ private struct CaptureOverlayEditorView: View {
                 .controlSize(.small)
                 .frame(width: CaptureToolbarLayout.buttonSize, height: CaptureToolbarLayout.buttonSize)
         } else {
-            actionButton(.translation, help: "翻译图片", action: translate)
+            actionButton(
+                .translation,
+                help: !document.hasScreenshotTranslation
+                    ? "截图翻译"
+                    : (document.showsScreenshotTranslation ? "查看原图" : "查看译文"),
+                isSelected: document.hasScreenshotTranslation && document.showsScreenshotTranslation,
+                action: translate
+            )
         }
         actionButton(.save, help: "保存", action: save)
         actionButton(.pin, help: "钉图", action: pin)
@@ -1324,20 +1654,30 @@ private struct CaptureOverlayEditorView: View {
     @ViewBuilder
     private var scrollingToolbarControls: some View {
         actionButton(.close, help: "关闭长截图", role: .destructive, action: onCancel)
-        actionButton(.pen, help: "编辑", action: onEdit)
-        actionButton(.pin, help: "钉在桌面", action: pin)
-        actionButton(.save, help: "下载长截图", action: save)
-        if document.isExporting {
+        if scrollingModel.isPreparing {
             ProgressView()
                 .controlSize(.small)
                 .frame(width: CaptureToolbarLayout.buttonSize, height: CaptureToolbarLayout.buttonSize)
+            Text("正在准备长截图…")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
+                .frame(maxWidth: .infinity)
         } else {
-            actionButton(.confirm, help: "完成并复制", role: .accent, action: complete)
+            actionButton(.pen, help: "编辑", action: onEdit)
+            actionButton(.pin, help: "钉在桌面", action: pin)
+            actionButton(.save, help: "下载长截图", action: save)
+            if document.isExporting {
+                ProgressView()
+                    .controlSize(.small)
+                    .frame(width: CaptureToolbarLayout.buttonSize, height: CaptureToolbarLayout.buttonSize)
+            } else {
+                actionButton(.confirm, help: "完成并复制", role: .accent, action: complete)
+            }
         }
     }
 
     private var toolbarTools: [AnnotationTool] {
-        [.select, .rectangle, .ellipse, .arrow, .line, .pen, .pixelate, .text, .watermark]
+        [.select, .rectangle, .highlight, .ellipse, .arrow, .line, .pen, .pixelate, .text, .step, .watermark]
     }
 
     private func toolButton(_ item: AnnotationTool) -> some View {
@@ -1349,6 +1689,7 @@ private struct CaptureOverlayEditorView: View {
             iconSize: CaptureToolbarLayout.iconSize,
             isBorderless: true,
             usesWhiteBackground: true,
+            usesPureWhiteIconInDarkMode: true,
             onHoverChange: toolbarHoverHandler(for: item.helloXToolbarHelp),
             action: { selectTool(item) }
         )
@@ -1370,6 +1711,7 @@ private struct CaptureOverlayEditorView: View {
             iconSize: CaptureToolbarLayout.iconSize,
             isBorderless: true,
             usesWhiteBackground: true,
+            usesPureWhiteIconInDarkMode: true,
             onHoverChange: toolbarHoverHandler(for: help),
             action: action
         )
@@ -1387,13 +1729,19 @@ private struct CaptureOverlayEditorView: View {
 
     @ViewBuilder
     private func exportStatus(in bounds: CGRect) -> some View {
-        if let message = document.exportError ?? document.exportMessage {
-            let isError = document.exportError != nil
+        if let message = document.screenshotTranslationError ?? document.exportError ?? document.exportMessage {
+            let isTranslationError = document.screenshotTranslationError != nil
+            let isError = isTranslationError || document.exportError != nil
             HStack(spacing: 8) {
                 HelloXIcon(icon: isError ? .warning : .success, size: 16)
                 Text(message).lineLimit(2)
                 if isError {
-                    HelloXIconButton(icon: .update, help: "重试复制", role: .accent, action: onComplete)
+                    HelloXIconButton(
+                        icon: .update,
+                        help: isTranslationError ? "重试截图翻译" : "重试复制",
+                        role: .accent,
+                        action: isTranslationError ? translate : onComplete
+                    )
                 }
             }
             .font(.system(size: 13, weight: .medium))
@@ -1424,22 +1772,65 @@ private struct CaptureOverlayEditorView: View {
     }
 
     private var annotationGesture: some Gesture {
-        DragGesture(minimumDistance: tool == .text || tool == .select || (tool == .pixelate && mosaicMode == .brush) ? 0 : 2)
+        DragGesture(
+            minimumDistance: 0,
+            coordinateSpace: .named(CaptureOverlayCoordinateSpace.name)
+        )
             .onChanged { value in
                 guard !scrollingModel.isActive, selection.contains(value.startLocation) else { return }
                 guard tool != .watermark else { return }
                 if isEditingText {
-                    finishInlineTextEditing()
+                    let startsStepBadgeDrag = selectedAnnotationDraft.map {
+                        AnnotationEditingGeometry.isStepBadge(
+                            at: value.startLocation,
+                            annotation: $0,
+                            number: StepAnnotationNumbering.number(
+                                for: $0.id,
+                                in: document.annotations
+                            ) ?? 1,
+                            imageRect: imageFrame,
+                            sourceImageSize: sourceImageSize
+                        )
+                    } ?? false
+                    finishInlineTextEditing(
+                        keepsSelection: startsStepBadgeDrag,
+                        whenStartingStepBadgeDrag: startsStepBadgeDrag
+                    )
+                    if startsStepBadgeDrag, let selectedAnnotationDraft {
+                        originalSelectedAnnotation = selectedAnnotationDraft
+                        isDraggingStepBadge = true
+                        isDraggingStepCard = false
+                        didMoveSelectedText = false
+                        editsSelectedStepTextOnRelease = false
+                        isAnnotationSelectionInteraction = true
+                        updateSelectionDrag(value)
+                    }
                     return
                 }
                 guard interactionThrottle.shouldProcess(value.location) else { return }
-                if tool == .select {
+                if dragStart == nil, originalSelectedAnnotation == nil, originalSelection == nil,
+                   !isAnnotationSelectionInteraction {
+                    let hit = hitAnnotation(at: value.startLocation)
+                    if hoveredAnnotationID != hit?.id { hoveredAnnotationID = hit?.id }
+                    if tool == .select || (tool != .pixelate && hit != nil) {
+                        isAnnotationSelectionInteraction = true
+                    } else {
+                        selectedAnnotationID = nil
+                        selectedAnnotationDraft = nil
+                        propertyEditRegistered = false
+                    }
+                }
+                if isAnnotationSelectionInteraction {
                     updateSelectionDrag(value)
                     return
                 }
                 let start = normalize(value.startLocation)
                 let end = normalize(value.location)
                 if dragStart == nil { dragStart = start; penPoints = [start] }
+                if tool == .step {
+                    draft = nil
+                    return
+                }
                 let isFreehand = tool == .pen || (tool == .pixelate && mosaicMode == .brush)
                 if isFreehand, shouldAppendPenPoint(end, to: penPoints) { penPoints.append(end) }
                 draft = makeAnnotation(start: start, end: end, points: isFreehand ? penPoints : [])
@@ -1447,29 +1838,48 @@ private struct CaptureOverlayEditorView: View {
             .onEnded { value in
                 interactionThrottle.reset()
                 guard tool != .watermark else { return }
-                if tool == .select {
+                if isAnnotationSelectionInteraction {
                     finishSelectionDrag()
+                    isAnnotationSelectionInteraction = false
                     return
                 }
                 defer { dragStart = nil; penPoints.removeAll(); draft = nil }
                 guard let start = dragStart else { return }
                 let end = normalize(value.location)
                 let isFreehand = tool == .pen || (tool == .pixelate && mosaicMode == .brush)
-                var annotation = makeAnnotation(
-                    start: start,
-                    end: end,
-                    points: isFreehand ? penPoints + [end] : []
-                )
-                if tool == .text { annotation.text = "" }
-                if annotation.normalizedRect.width > 0.002 || annotation.normalizedRect.height > 0.002 || tool == .text || (tool == .pixelate && mosaicMode == .brush) {
+                var annotation: Annotation
+                if tool == .step {
+                    annotation = AnnotationEditingGeometry.makeStepAnnotation(
+                        at: value.startLocation,
+                        number: document.annotations.filter { $0.tool == .step }.count + 1,
+                        imageRect: imageFrame,
+                        editingBounds: selection,
+                        sourceImageSize: sourceImageSize,
+                        color: rgbaColor,
+                        lineWidth: lineWidth
+                    )
+                } else {
+                    annotation = makeAnnotation(
+                        start: start,
+                        end: end,
+                        points: isFreehand ? penPoints + [end] : []
+                    )
+                }
+                if tool == .text || tool == .step { annotation.text = "" }
+                if annotation.normalizedRect.width > 0.002 || annotation.normalizedRect.height > 0.002 || tool == .text || tool == .step || (tool == .pixelate && mosaicMode == .brush) {
                     document.add(annotation)
-                    if tool == .text {
+                    if tool == .text || tool == .step {
                         selectedAnnotationID = annotation.id
                         selectedAnnotationDraft = annotation
                         propertyEditRegistered = true
                         syncProperties(from: annotation)
-                        tool = .select
-                        beginInlineTextEditing()
+                        if AnnotationInlineEditingPolicy.beginsImmediatelyAfterCreation(for: tool) {
+                            beginInlineTextEditing()
+                        }
+                    } else {
+                        selectedAnnotationID = nil
+                        selectedAnnotationDraft = nil
+                        propertyEditRegistered = false
                     }
                 }
             }
@@ -1512,6 +1922,18 @@ private struct CaptureOverlayEditorView: View {
                 lineWidth = value
                 guard var selected = selectedAnnotationDraft else { return }
                 selected.lineWidth = value
+                if selected.tool == .step {
+                    selected = AnnotationEditingGeometry.fittedStepAnnotation(
+                        selected,
+                        number: StepAnnotationNumbering.number(
+                            for: selected.id,
+                            in: document.annotations
+                        ) ?? 1,
+                        imageRect: imageFrame,
+                        editingBounds: selection,
+                        sourceImageSize: sourceImageSize
+                    )
+                }
                 selectedAnnotationDraft = selected
                 persistPropertyChange(selected)
             }
@@ -1570,6 +1992,32 @@ private struct CaptureOverlayEditorView: View {
         )
     }
 
+    private var propertyHighlightShowsBorderBinding: Binding<Bool> {
+        Binding(
+            get: { selectedAnnotationDraft?.highlightShowsBorder ?? highlightShowsBorder },
+            set: { value in
+                highlightShowsBorder = value
+                guard var selected = selectedAnnotationDraft, selected.tool == .highlight else { return }
+                selected.highlightShowsBorder = value
+                selectedAnnotationDraft = selected
+                persistPropertyChange(selected)
+            }
+        )
+    }
+
+    private var propertyHighlightShapeBinding: Binding<AnnotationHighlightShape> {
+        Binding(
+            get: { selectedAnnotationDraft?.highlightShape ?? highlightShape },
+            set: { value in
+                highlightShape = value
+                guard var selected = selectedAnnotationDraft, selected.tool == .highlight else { return }
+                selected.highlightShape = value
+                selectedAnnotationDraft = selected
+                persistPropertyChange(selected)
+            }
+        )
+    }
+
     private func selectTool(_ newTool: AnnotationTool) {
         finishInlineTextEditing()
         commitSelectedAnnotation()
@@ -1579,6 +2027,13 @@ private struct CaptureOverlayEditorView: View {
         if newTool == .watermark {
             activateWatermarkTool()
         } else {
+            if newTool == .highlight, tool != .highlight {
+                color = Color(
+                    red: AnnotationHighlightStyle.defaultColor.red,
+                    green: AnnotationHighlightStyle.defaultColor.green,
+                    blue: AnnotationHighlightStyle.defaultColor.blue
+                )
+            }
             tool = newTool
         }
     }
@@ -1614,26 +2069,76 @@ private struct CaptureOverlayEditorView: View {
                 selectedAnnotationDraft = hit
                 originalSelectedAnnotation = hit
                 propertyEditRegistered = false
-                syncProperties(from: hit)
                 didMoveSelectedText = false
+                let stepNumber = StepAnnotationNumbering.number(
+                    for: hit.id,
+                    in: document.annotations
+                ) ?? 1
+                isDraggingStepBadge = hit.tool == .step
+                    && AnnotationEditingGeometry.isStepBadge(
+                        at: value.startLocation,
+                        annotation: hit,
+                        number: stepNumber,
+                        imageRect: imageFrame,
+                        sourceImageSize: sourceImageSize
+                    )
+                isDraggingStepCard = hit.tool == .step
+                    && !isDraggingStepBadge
+                    && AnnotationEditingGeometry.isStepTextInput(
+                        at: value.startLocation,
+                        annotation: hit,
+                        number: stepNumber,
+                        imageRect: imageFrame,
+                        sourceImageSize: sourceImageSize
+                    )
+                editsSelectedStepTextOnRelease = isDraggingStepCard
             } else {
                 selectedAnnotationID = nil
                 selectedAnnotationDraft = nil
                 propertyEditRegistered = false
-                originalSelection = selection
+                if !document.isScreenshotTranslationSelectionLocked {
+                    originalSelection = selection
+                }
             }
         }
 
         if let originalSelectedAnnotation {
             didMoveSelectedText = abs(value.translation.width) > 2 || abs(value.translation.height) > 2
-            selectedAnnotationDraft = AnnotationEditingGeometry.moved(
-                originalSelectedAnnotation,
-                by: value.translation,
-                imageRect: imageFrame,
-                editingBounds: selection,
-                sourceImageSize: sourceImageSize
-            )
-        } else if let originalSelection {
+            if isDraggingStepBadge {
+                selectedAnnotationDraft = AnnotationEditingGeometry.movedStepBadge(
+                    originalSelectedAnnotation,
+                    by: value.translation,
+                    number: StepAnnotationNumbering.number(
+                        for: originalSelectedAnnotation.id,
+                        in: document.annotations
+                    ) ?? 1,
+                    imageRect: imageFrame,
+                    editingBounds: selection,
+                    sourceImageSize: sourceImageSize
+                )
+            } else if isDraggingStepCard {
+                selectedAnnotationDraft = AnnotationEditingGeometry.movedStepCard(
+                    originalSelectedAnnotation,
+                    by: value.translation,
+                    number: StepAnnotationNumbering.number(
+                        for: originalSelectedAnnotation.id,
+                        in: document.annotations
+                    ) ?? 1,
+                    imageRect: imageFrame,
+                    editingBounds: selection,
+                    sourceImageSize: sourceImageSize
+                )
+            } else {
+                selectedAnnotationDraft = AnnotationEditingGeometry.moved(
+                    originalSelectedAnnotation,
+                    by: value.translation,
+                    imageRect: imageFrame,
+                    editingBounds: selection,
+                    sourceImageSize: sourceImageSize
+                )
+            }
+        } else if let originalSelection,
+                  !document.isScreenshotTranslationSelectionLocked {
             selectionBinding.wrappedValue = SelectionGeometry.moved(
                 originalSelection,
                 by: value.translation,
@@ -1644,28 +2149,40 @@ private struct CaptureOverlayEditorView: View {
 
     private func finishSelectionDrag() {
         let shouldEditInline = originalSelectedAnnotation != nil && !didMoveSelectedText
+        let shouldEditStepText = shouldEditInline && editsSelectedStepTextOnRelease
         if originalSelectedAnnotation != nil {
             commitSelectedAnnotation()
             propertyEditRegistered = false
+        } else if originalSelection != nil,
+                  !document.isScreenshotTranslationSelectionLocked {
+            commitSelectionChange()
         }
         originalSelectedAnnotation = nil
         originalSelection = nil
         didMoveSelectedText = false
-        if shouldEditInline, selectedAnnotationDraft?.tool == .text { beginInlineTextEditing() }
+        editsSelectedStepTextOnRelease = false
+        isDraggingStepBadge = false
+        isDraggingStepCard = false
+        if shouldEditInline, selectedAnnotationDraft?.tool == .text {
+            beginInlineTextEditing()
+        } else if shouldEditStepText, selectedAnnotationDraft?.tool == .step {
+            beginInlineTextEditing()
+        }
     }
 
     @ViewBuilder
     private var inlineTextEditor: some View {
         if isEditingText,
            let annotation = selectedAnnotationDraft,
-           annotation.tool == .text {
+           annotation.tool == .text || annotation.tool == .step {
             InlineAnnotationTextEditor(
                 annotation: annotation,
                 imageRect: imageFrame,
                 editingBounds: selection,
                 sourceImageSize: sourceImageSize,
+                stepNumber: StepAnnotationNumbering.number(for: annotation.id, in: document.annotations),
                 buffer: inlineTextBuffer,
-                onCommit: finishInlineTextEditing,
+                onCommit: { finishInlineTextEditing() },
                 onCancel: cancelInlineTextEditing
             )
             .id(annotation.id)
@@ -1673,23 +2190,48 @@ private struct CaptureOverlayEditorView: View {
     }
 
     private func beginInlineTextEditing() {
-        guard selectedAnnotationDraft?.tool == .text else { return }
+        guard selectedAnnotationDraft?.tool == .text || selectedAnnotationDraft?.tool == .step else { return }
         inlineTextBuffer.text = selectedAnnotationDraft?.text ?? ""
         isEditingText = true
     }
 
-    private func finishInlineTextEditing() {
+    private func finishInlineTextEditing(
+        keepsSelection: Bool = false,
+        whenStartingStepBadgeDrag: Bool = false
+    ) {
         guard isEditingText else { return }
         if var annotation = selectedAnnotationDraft {
             let value = inlineTextBuffer.text
             if value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                document.removeAnnotation(id: annotation.id)
-                selectedAnnotationID = nil
-                selectedAnnotationDraft = nil
+                if AnnotationInlineEditingPolicy.removesEmptyAnnotation(
+                    tool: annotation.tool,
+                    whenStartingStepBadgeDrag: whenStartingStepBadgeDrag
+                ) {
+                    document.removeAnnotation(id: annotation.id)
+                    selectedAnnotationID = nil
+                    selectedAnnotationDraft = nil
+                } else {
+                    annotation.text = ""
+                    selectedAnnotationDraft = annotation
+                    persistPropertyChange(annotation)
+                }
                 isEditingText = false
+                propertyEditRegistered = false
                 return
             }
             annotation.text = value
+            if annotation.tool == .step {
+                annotation = AnnotationEditingGeometry.fittedStepAnnotation(
+                    annotation,
+                    number: StepAnnotationNumbering.number(
+                        for: annotation.id,
+                        in: document.annotations
+                    ) ?? 1,
+                    imageRect: imageFrame,
+                    editingBounds: selection,
+                    sourceImageSize: sourceImageSize
+                )
+            }
             annotation = AnnotationEditingGeometry.moved(
                 annotation,
                 by: .zero,
@@ -1702,6 +2244,11 @@ private struct CaptureOverlayEditorView: View {
             persistPropertyChange(annotation)
         }
         isEditingText = false
+        if !keepsSelection {
+            selectedAnnotationID = nil
+            selectedAnnotationDraft = nil
+        }
+        propertyEditRegistered = false
     }
 
     private func cancelInlineTextEditing() {
@@ -1711,6 +2258,34 @@ private struct CaptureOverlayEditorView: View {
             selectedAnnotationDraft = nil
         }
         isEditingText = false
+        selectedAnnotationID = nil
+        selectedAnnotationDraft = nil
+        propertyEditRegistered = false
+    }
+
+    private func hitAnnotation(at point: CGPoint) -> Annotation? {
+        AnnotationEditingGeometry.hitAnnotation(
+            at: point,
+            annotations: document.annotations,
+            imageRect: imageFrame,
+            editingBounds: selection,
+            sourceImageSize: sourceImageSize
+        )
+    }
+
+    private func deleteSelectedAnnotation() -> Bool {
+        guard !isEditingText, let id = selectedAnnotationID else { return false }
+        document.removeAnnotation(id: id)
+        selectedAnnotationID = nil
+        selectedAnnotationDraft = nil
+        originalSelectedAnnotation = nil
+        resizeOriginalAnnotation = nil
+        propertyEditRegistered = false
+        isAnnotationSelectionInteraction = false
+        editsSelectedStepTextOnRelease = false
+        isDraggingStepBadge = false
+        isDraggingStepCard = false
+        return true
     }
 
     private func syncProperties(from annotation: Annotation) {
@@ -1771,6 +2346,20 @@ private struct CaptureOverlayEditorView: View {
         onTranslate()
     }
 
+    private func requestOfflineScreenshotTranslation() {
+        guard let request = document.pendingScreenshotTranslationRequest else { return }
+        let source = request.sourceLanguageIdentifier.map(Locale.Language.init(identifier:))
+        let target = Locale.Language(identifier: request.targetLanguageIdentifier)
+        if var configuration = screenshotTranslationConfiguration,
+           configuration.source == source,
+           configuration.target == target {
+            configuration.invalidate()
+            screenshotTranslationConfiguration = configuration
+        } else {
+            screenshotTranslationConfiguration = TranslationSession.Configuration(source: source, target: target)
+        }
+    }
+
     private func beginScrolling() {
         finishInlineTextEditing()
         commitSelectedAnnotation()
@@ -1806,7 +2395,9 @@ private struct CaptureOverlayEditorView: View {
             color: rgbaColor,
             lineWidth: lineWidth,
             mosaicMode: mosaicMode,
-            mosaicBlockSize: mosaicBlockSize
+            mosaicBlockSize: mosaicBlockSize,
+            highlightShowsBorder: highlightShowsBorder,
+            highlightShape: highlightShape
         )
     }
 
@@ -1831,9 +2422,14 @@ private struct CaptureOverlayEditorView: View {
         ) >= 1.5
     }
 
-    private func draw(_ annotation: Annotation, context: inout GraphicsContext) {
+    private func draw(
+        _ annotation: Annotation,
+        stepNumber: Int?,
+        context: inout GraphicsContext
+    ) {
         AnnotationCanvasDrawing.draw(
             annotation,
+            stepNumber: stepNumber,
             image: document.image,
             imageRect: imageFrame,
             mosaicCache: mosaicCache,
@@ -1846,62 +2442,44 @@ private struct CaptureOverlayEditorView: View {
     }
 }
 
-private struct ImageTranslationCanvasOverlay: View {
-    let blocks: [ImageTranslationBlock]
+private struct ScreenshotTranslationCanvasOverlay: NSViewRepresentable {
+    let blocks: [ScreenshotTranslationBlock]
     let selection: CGRect
     let sourceImageSize: CGSize
 
-    var body: some View {
-        ZStack(alignment: .topLeading) {
-            ForEach(blocks) { block in
-                let rect = displayRect(for: block.boundingBox)
-                let preferredSize = block.appearance.fontSize * selection.height / max(1, sourceImageSize.height)
-                let fittedFontSize = ImageTranslationTextLayout.fittedFontSize(
-                    for: block.text,
-                    in: rect,
-                    preferredSize: preferredSize
-                )
-                let fontSize = fittedFontSize * ImageTranslationTextLayout.forcedFontScale
-                Text(block.text)
-                    .font(.system(size: fontSize, weight: .regular))
-                    .foregroundStyle(Color(
-                        red: block.appearance.foregroundColor.red,
-                        green: block.appearance.foregroundColor.green,
-                        blue: block.appearance.foregroundColor.blue,
-                        opacity: block.appearance.foregroundColor.alpha
-                    ))
-                    .multilineTextAlignment(.leading)
-                    .lineLimit(1)
-                    .padding(.horizontal, horizontalPadding(for: fontSize))
-                    .padding(.vertical, verticalPadding(for: fontSize))
-                    .frame(width: rect.width, height: rect.height, alignment: .leading)
-                    .background(Color(
-                        red: block.appearance.backgroundColor.red,
-                        green: block.appearance.backgroundColor.green,
-                        blue: block.appearance.backgroundColor.blue,
-                        opacity: block.appearance.backgroundColor.alpha
-                    ))
-                    .position(x: rect.midX, y: rect.midY)
-            }
-        }
+    func makeNSView(context: Context) -> ScreenshotTranslationOverlayNSView {
+        ScreenshotTranslationOverlayNSView()
     }
 
-    private func displayRect(for boundingBox: CGRect) -> CGRect {
-        let box = boundingBox.standardized.intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
-        return CGRect(
-            x: selection.minX + box.minX * selection.width,
-            y: selection.minY + (1 - box.maxY) * selection.height,
-            width: max(1, box.width * selection.width),
-            height: max(1, box.height * selection.height)
+    func updateNSView(_ nsView: ScreenshotTranslationOverlayNSView, context: Context) {
+        nsView.blocks = blocks
+        nsView.selection = selection
+        nsView.sourceImageSize = sourceImageSize
+        nsView.needsDisplay = true
+    }
+}
+
+private final class ScreenshotTranslationOverlayNSView: NSView {
+    var blocks: [ScreenshotTranslationBlock] = []
+    var selection: CGRect = .zero
+    var sourceImageSize: CGSize = .zero
+
+    override var isFlipped: Bool { true }
+    override var isOpaque: Bool { false }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard selection.width > 0, selection.height > 0 else { return }
+        NSGraphicsContext.saveGraphicsState()
+        NSBezierPath(rect: selection).addClip()
+        ScreenshotTranslationDrawing.draw(
+            blocks,
+            in: selection,
+            sourceImageSize: sourceImageSize
         )
-    }
-
-    private func horizontalPadding(for fontSize: CGFloat) -> CGFloat {
-        max(2, fontSize * 0.16)
-    }
-
-    private func verticalPadding(for fontSize: CGFloat) -> CGFloat {
-        max(1, fontSize * 0.10)
+        NSGraphicsContext.restoreGraphicsState()
     }
 }
 
@@ -1922,16 +2500,33 @@ private struct ScrollingCapturePreviewView: View {
             HelloXTheme.cardGradient(for: colorScheme),
             in: RoundedRectangle(cornerRadius: 15, style: .continuous)
         )
-        .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.34 : 0.18), radius: 18, y: 8)
+        .shadow(color: HelloXTheme.shadow(for: colorScheme), radius: 18, y: 8)
     }
 
     private var heightLabel: some View {
-        Text(model.direction.isHorizontal
-            ? "宽度 \(model.pixelWidth) px"
-            : "高度 \(model.pixelHeight) px")
-            .font(.system(size: 11, weight: .semibold, design: .monospaced))
-            .foregroundStyle(HelloXTheme.primaryText(for: colorScheme))
-            .frame(maxWidth: .infinity, alignment: .leading)
+        VStack(alignment: .leading, spacing: 4) {
+            if model.isPreparing {
+                Text("正在取得初始画面…")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(HelloXTheme.primaryText(for: colorScheme))
+            } else {
+                Text(model.direction.isHorizontal
+                    ? "宽度 \(model.pixelWidth) px"
+                    : "高度 \(model.pixelHeight) px")
+                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(HelloXTheme.primaryText(for: colorScheme))
+                Text("将鼠标移入截图区域后滚动")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(HelloXTheme.secondaryText(for: colorScheme))
+            }
+            if let error = model.lastCaptureError {
+                Text(error)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.red.opacity(0.9))
+                    .lineLimit(2)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var stitchedPreview: some View {
@@ -1947,15 +2542,13 @@ private struct ScrollingCapturePreviewView: View {
             }
             .scrollContentBackground(.hidden)
             .seamlessScrollChrome()
-            .onChange(of: model.pixelWidth &* 31 &+ model.pixelHeight) { extent in
+            .onChange(of: model.pixelWidth &* 31 &+ model.pixelHeight) { _, extent in
                 guard extent > 0 else { return }
-                withAnimation(.easeOut(duration: 0.18)) {
-                    switch model.direction {
-                    case .down: reader.scrollTo("preview-end", anchor: .bottom)
-                    case .up: reader.scrollTo("preview-start", anchor: .top)
-                    case .right: reader.scrollTo("preview-end", anchor: .trailing)
-                    case .left: reader.scrollTo("preview-start", anchor: .leading)
-                    }
+                switch model.direction {
+                case .down: reader.scrollTo("preview-end", anchor: .bottom)
+                case .up: reader.scrollTo("preview-start", anchor: .top)
+                case .right: reader.scrollTo("preview-end", anchor: .trailing)
+                case .left: reader.scrollTo("preview-start", anchor: .leading)
                 }
             }
         }
@@ -1998,45 +2591,32 @@ private struct ScrollingCapturePreviewView: View {
 
 }
 
-private struct SelectionMoveView: View {
-    @Binding var selection: CGRect
-    let bounds: CGRect
-    @State private var original: CGRect?
-
-    var body: some View {
-        Color.clear
-            .contentShape(Rectangle())
-            .frame(width: selection.width, height: selection.height)
-            .position(x: selection.midX, y: selection.midY)
-            .gesture(DragGesture(minimumDistance: 2)
-                .onChanged { value in
-                    if original == nil { original = selection }
-                    guard let original else { return }
-                    selection = SelectionGeometry.moved(original, by: value.translation, within: bounds)
-                }
-                .onEnded { _ in original = nil })
-    }
-}
-
 private struct SelectionResizeHandle: View {
     let handle: SelectionHandle
     @Binding var selection: CGRect
     let bounds: CGRect
+    let onEnded: () -> Void
     @State private var original: CGRect?
 
     var body: some View {
         RoundedRectangle(cornerRadius: 2)
             .fill(HelloXTheme.accent)
             .frame(width: 10, height: 10)
-            .overlay(RoundedRectangle(cornerRadius: 2).stroke(.white, lineWidth: 1))
+            .overlay(RoundedRectangle(cornerRadius: 2).stroke(HelloXTheme.prominentForeground, lineWidth: 1))
             .position(position)
-            .gesture(DragGesture(minimumDistance: 0)
+            .gesture(DragGesture(
+                minimumDistance: 0,
+                coordinateSpace: .named(CaptureOverlayCoordinateSpace.name)
+            )
                 .onChanged { value in
                     if original == nil { original = selection }
                     guard let original else { return }
                     selection = SelectionGeometry.resized(original, handle: handle, by: value.translation, within: bounds)
                 }
-                .onEnded { _ in original = nil })
+                .onEnded { _ in
+                    original = nil
+                    onEnded()
+                })
     }
 
     private var position: CGPoint {

@@ -13,8 +13,8 @@ enum EditorImageSnapshotMode {
     case annotatedOutput
 }
 
-struct ImageTranslationOfflineRequest: Identifiable {
-    let id = UUID()
+struct ScreenshotTranslationRequest: Identifiable {
+    let id: UUID
     let paragraphs: [RecognizedTextParagraph]
     let sourceLanguageIdentifier: String?
     let targetLanguageIdentifier: String
@@ -25,9 +25,11 @@ final class EditorDocument: ObservableObject {
     @Published var image: CGImage
     @Published var annotations: [Annotation] = []
     @Published var ocrResult: OCRResult?
-    @Published var translatedText: String?
-    @Published var imageTranslationBlocks: [ImageTranslationBlock] = []
-    @Published private(set) var pendingImageTranslationRequest: ImageTranslationOfflineRequest?
+    @Published private(set) var screenshotTranslationBlocks: [ScreenshotTranslationBlock] = []
+    @Published private(set) var screenshotTranslationBackgroundImage: CGImage?
+    @Published private(set) var pendingScreenshotTranslationRequest: ScreenshotTranslationRequest?
+    @Published var showsScreenshotTranslation = true
+    @Published private(set) var screenshotTranslationError: String?
     @Published var isPerformingOCR = false
     @Published var isPerformingTranslation = false
     @Published var dirty = false
@@ -41,6 +43,8 @@ final class EditorDocument: ObservableObject {
     private let appModel: AppModel
     private var undoStack: [[Annotation]] = []
     private var redoStack: [[Annotation]] = []
+    private var screenshotTranslationTask: Task<Void, Never>?
+    private var screenshotTranslationOperationID: UUID?
 
     init(result: CaptureResult, appModel: AppModel, outputCrop: CGRect? = nil) {
         self.image = result.image
@@ -49,19 +53,24 @@ final class EditorDocument: ObservableObject {
         self.outputCrop = outputCrop
     }
 
-    var translationProfiles: [TranslationProfile] { appModel.enabledTranslationProfiles }
-    var defaultTranslationProfileID: UUID? { appModel.defaultTranslationProfileID }
     var isOfflineTranslationEnabled: Bool { appModel.isOfflineTranslationEnabled }
+    var canUndo: Bool { !undoStack.isEmpty }
+    var canRedo: Bool { !redoStack.isEmpty }
+
+    var hasScreenshotTranslation: Bool {
+        screenshotTranslationBackgroundImage != nil || !screenshotTranslationBlocks.isEmpty
+    }
+
+    var isScreenshotTranslationSelectionLocked: Bool {
+        ScreenshotTranslationInteractionPolicy.locksSelection(
+            hasTranslationBlocks: hasScreenshotTranslation,
+            hasReconstructedBackground: screenshotTranslationBackgroundImage != nil
+        )
+    }
 
     func add(_ annotation: Annotation) {
         pushUndo()
         annotations.append(annotation)
-        dirty = true
-    }
-
-    func updateLast(_ annotation: Annotation) {
-        guard !annotations.isEmpty else { return }
-        annotations[annotations.count - 1] = annotation
         dirty = true
     }
 
@@ -114,8 +123,7 @@ final class EditorDocument: ObservableObject {
         pushUndo()
         image = result
         annotations.removeAll()
-        imageTranslationBlocks.removeAll()
-        translatedText = nil
+        clearScreenshotTranslation()
         self.cropSelection = nil
         dirty = true
     }
@@ -125,160 +133,298 @@ final class EditorDocument: ObservableObject {
         isPerformingOCR = true
         Task { @MainActor in
             defer { isPerformingOCR = false }
-            do { ocrResult = try await appModel.ocrService.recognizeText(in: try imageForOutput()) }
+            do { ocrResult = try await appModel.ocrService.recognizeText(in: try originalSelectionImage()) }
             catch { appModel.lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription }
         }
     }
 
-    func translate(source: SupportedLanguage, target: SupportedLanguage, profileID: UUID? = nil) {
-        guard !isPerformingTranslation else { return }
-        guard let text = ocrResult?.text, !text.isEmpty else {
-            appModel.lastError = HelloXError.noTextFound.localizedDescription
-            return
-        }
-        isPerformingTranslation = true
-        Task { @MainActor in
-            defer { isPerformingTranslation = false }
-            do {
-                let request = TranslationRequest(text: text, sourceLanguage: source, targetLanguage: target)
-                translatedText = try await appModel.provider(for: request, profileID: profileID).translate(request).text
-            } catch { appModel.lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription }
-        }
-    }
-
-    /// Translates complete OCR paragraphs and anchors each translated paragraph
-    /// to the union of its source lines. Line breaks are restored only after the
-    /// paragraph has been translated with its full context.
-    func translateImageInPlace() {
+    /// Runs local OCR, then translates recognized paragraphs with the selected text
+    /// provider or Apple's on-device Translation framework before redrawing them locally.
+    func translateScreenshot() {
         guard !isPerformingOCR, !isPerformingTranslation else { return }
+        clearScreenshotTranslation()
+        let operationID = UUID()
+        screenshotTranslationOperationID = operationID
         isPerformingOCR = true
         isPerformingTranslation = true
-        imageTranslationBlocks.removeAll()
-        translatedText = nil
-        Task { @MainActor in
+        showsScreenshotTranslation = true
+        screenshotTranslationTask = Task { @MainActor [weak self] in
+            guard let self else { return }
             do {
-                let sourceImage = try imageForOutput()
+                let sourceImage = try originalSelectionImage()
+                let target = appModel.screenshotTranslationTargetLanguage
                 let recognized = try await appModel.ocrService.recognizeText(in: sourceImage)
+                try Task.checkCancellation()
+                guard screenshotTranslationOperationID == operationID else { return }
                 guard !recognized.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                     throw HelloXError.noTextFound
                 }
                 ocrResult = recognized
                 isPerformingOCR = false
-                let source = recognized.language.flatMap(SupportedLanguage.init(rawValue:)) ?? .auto
-                let target: SupportedLanguage = source == .simplifiedChinese || source == .traditionalChinese
-                    ? .english
-                    : .simplifiedChinese
-                let paragraphs = OCRParagraphLayout.paragraphs(from: recognized.blocks)
+                let imageSize = CGSize(width: sourceImage.width, height: sourceImage.height)
+                let translatableBlocks = ScreenshotTranslationContentPolicy.translatableContents(
+                    from: recognized.blocks,
+                    imageSize: imageSize
+                )
+                let paragraphs = OCRParagraphLayout.paragraphs(from: translatableBlocks)
                 guard !paragraphs.isEmpty else { throw HelloXError.noTextFound }
-
-                // Prefer a configured cloud profile for image translation so
-                // the OCR text is translated through the user's API and can
-                // be rendered back into its original image locations.
-                if appModel.enabledTranslationProfiles.isEmpty,
-                   appModel.isOfflineTranslationEnabled {
-                    pendingImageTranslationRequest = ImageTranslationOfflineRequest(
-                        paragraphs: paragraphs,
-                        sourceLanguageIdentifier: source.systemLanguageIdentifier,
-                        targetLanguageIdentifier: target.systemLanguageIdentifier ?? target.rawValue
+                let source = recognized.language.flatMap(SupportedLanguage.init(rawValue:)) ?? .auto
+                let request = ScreenshotTranslationRequest(
+                    id: operationID,
+                    paragraphs: paragraphs,
+                    sourceLanguageIdentifier: source.systemLanguageIdentifier,
+                    targetLanguageIdentifier: target.systemLanguageIdentifier ?? target.rawValue
+                )
+                if source.isSameLanguage(as: target) {
+                    finishScreenshotTranslation(
+                        request: request,
+                        translations: Dictionary(uniqueKeysWithValues: paragraphs.map {
+                            ($0.id, ScreenshotTranslationContentPolicy.textForTranslation($0.text))
+                        })
                     )
                     return
                 }
-
-                let provider = try appModel.provider(for: TranslationRequest(
-                    text: paragraphs[0].text,
-                    sourceLanguage: source,
-                    targetLanguage: target
-                ))
-                var translations: [UUID: String] = [:]
-                var firstError: String?
-                await withTaskGroup(of: (UUID, String?, String?).self) { group in
-                    for paragraph in paragraphs {
-                        group.addTask {
-                            do {
-                                let request = TranslationRequest(
-                                    text: paragraph.text,
-                                    sourceLanguage: source,
-                                    targetLanguage: target
-                                )
-                                return (paragraph.id, try await provider.translate(request).text, nil)
-                            } catch {
-                                return (paragraph.id, nil, error.localizedDescription)
-                            }
-                        }
+                if !appModel.enabledTranslationProfiles.isEmpty {
+                    do {
+                        try await translateScreenshotUsingCloud(
+                            request: request,
+                            source: source,
+                            target: target
+                        )
+                    } catch HelloXError.rateLimited where appModel.isOfflineTranslationEnabled {
+                        guard screenshotTranslationOperationID == operationID else { return }
+                        pendingScreenshotTranslationRequest = request
+                        screenshotTranslationTask = nil
                     }
-                    for await (id, text, errorMessage) in group {
-                        if let text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                            translations[id] = text
-                        } else if firstError == nil {
-                            firstError = errorMessage
-                        }
-                    }
+                } else if appModel.isOfflineTranslationEnabled {
+                    guard screenshotTranslationOperationID == operationID else { return }
+                    pendingScreenshotTranslationRequest = request
+                    screenshotTranslationTask = nil
+                } else {
+                    throw HelloXError.invalidConfiguration("请配置一个云端翻译服务，或启用离线翻译")
                 }
-
-                let appearances = ImageTranslationAppearanceExtractor.appearances(for: recognized.blocks, in: sourceImage)
-                let renderedBlocks = makeImageTranslationBlocks(
-                    paragraphs: paragraphs,
-                    translations: translations,
-                    appearances: appearances,
-                    imageSize: CGSize(width: sourceImage.width, height: sourceImage.height)
-                )
-                guard !renderedBlocks.isEmpty else {
-                    throw HelloXError.captureFailed(firstError ?? "图片翻译失败")
-                }
-                applyImageTranslations(renderedBlocks)
-            } catch {
+            } catch is CancellationError {
+                guard screenshotTranslationOperationID == operationID else { return }
+                screenshotTranslationTask = nil
+                screenshotTranslationOperationID = nil
                 isPerformingOCR = false
                 isPerformingTranslation = false
-                pendingImageTranslationRequest = nil
-                appModel.lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            } catch {
+                failScreenshotTranslation(error, operationID: operationID)
             }
         }
     }
 
-    func completeOfflineImageTranslation(requestID: UUID, texts: [String]?, errorMessage: String?) {
-        guard let request = pendingImageTranslationRequest, request.id == requestID else { return }
-        pendingImageTranslationRequest = nil
-        isPerformingTranslation = false
-        guard let texts, texts.count == request.paragraphs.count else {
-            if let errorMessage { appModel.lastError = errorMessage }
+    func completeOfflineScreenshotTranslation(
+        requestID: UUID,
+        translations: [UUID: String]?,
+        errorMessage: String?
+    ) {
+        guard let request = pendingScreenshotTranslationRequest,
+              request.id == requestID,
+              screenshotTranslationOperationID == requestID else { return }
+        pendingScreenshotTranslationRequest = nil
+        guard let translations else {
+            failScreenshotTranslation(
+                HelloXError.captureFailed(errorMessage ?? "离线翻译失败"),
+                operationID: requestID
+            )
             return
         }
-        guard let sourceImage = try? imageForOutput() else { return }
-        let appearances = ImageTranslationAppearanceExtractor.appearances(
-            for: request.paragraphs.flatMap(\.blocks),
-            in: sourceImage
-        )
-        let translations = Dictionary(uniqueKeysWithValues: zip(request.paragraphs, texts).map { ($0.id, $1) })
-        let translatedBlocks = makeImageTranslationBlocks(
-            paragraphs: request.paragraphs,
-            translations: translations,
-            appearances: appearances,
-            imageSize: CGSize(width: sourceImage.width, height: sourceImage.height)
-        )
-        applyImageTranslations(translatedBlocks)
+        finishScreenshotTranslation(request: request, translations: translations)
     }
 
-    func beginOfflineTranslation() -> String? {
-        guard !isPerformingTranslation else { return nil }
-        guard appModel.isOfflineTranslationEnabled else {
-            appModel.lastError = "离线翻译已停用，请选择其他已启用的翻译服务。"
-            return nil
-        }
-        guard let text = ocrResult?.text, !text.isEmpty else {
-            appModel.lastError = HelloXError.noTextFound.localizedDescription
-            return nil
-        }
-        isPerformingTranslation = true
-        return text
-    }
-
-    func completeOfflineTranslation(text: String?, errorMessage: String?) {
+    func clearScreenshotTranslation() {
+        screenshotTranslationOperationID = nil
+        screenshotTranslationTask?.cancel()
+        screenshotTranslationTask = nil
+        pendingScreenshotTranslationRequest = nil
+        screenshotTranslationBlocks.removeAll()
+        screenshotTranslationBackgroundImage = nil
+        screenshotTranslationError = nil
+        showsScreenshotTranslation = true
+        isPerformingOCR = false
         isPerformingTranslation = false
-        if let text {
-            translatedText = text
-        } else if let errorMessage {
-            appModel.lastError = errorMessage
+    }
+
+    func toggleScreenshotTranslation() {
+        guard hasScreenshotTranslation else {
+            translateScreenshot()
+            return
         }
+        showsScreenshotTranslation.toggle()
+    }
+
+    private func translateScreenshotUsingCloud(
+        request: ScreenshotTranslationRequest,
+        source: SupportedLanguage,
+        target: SupportedLanguage
+    ) async throws {
+        guard appModel.defaultTextTranslationProfile != nil else {
+            throw HelloXError.invalidConfiguration("请启用离线翻译，或配置一个云端翻译服务")
+        }
+        guard confirmCloudScreenshotTranslationIfNeeded() else {
+            throw HelloXError.cancelled
+        }
+        let paragraphTexts = request.paragraphs.map {
+            (
+                id: $0.id,
+                text: ScreenshotTranslationContentPolicy.textForTranslation($0.text)
+            )
+        }
+        let batches = try ScreenshotTranslationBatchCodec.batches(for: paragraphTexts)
+        guard let firstBatch = batches.first else { throw HelloXError.noTextFound }
+        let seedRequest = TranslationRequest(
+            text: firstBatch.text,
+            sourceLanguage: source,
+            targetLanguage: target,
+            purpose: .screenshotBatch
+        )
+        let provider = try appModel.provider(for: seedRequest)
+        var translations: [UUID: String] = [:]
+        for (index, batch) in batches.enumerated() {
+            try Task.checkCancellation()
+            if index > 0 {
+                // Keep long screenshots below the common one-request-per-second
+                // threshold used by entry-level machine translation plans.
+                try await Task.sleep(nanoseconds: 1_100_000_000)
+            }
+            do {
+                let result = try await provider.translate(TranslationRequest(
+                    text: batch.text,
+                    sourceLanguage: source,
+                    targetLanguage: target,
+                    purpose: .screenshotBatch
+                ))
+                translations.merge(
+                    try ScreenshotTranslationBatchCodec.translations(
+                        from: result.text,
+                        for: batch
+                    ),
+                    uniquingKeysWith: { _, latest in latest }
+                )
+            } catch {
+                let isUnparseableResponse = (error as? HelloXError) == .invalidResponse
+                    || error is DecodingError
+                guard batch.paragraphs.count > 1, isUnparseableResponse else { throw error }
+                translations.merge(
+                    try await translateScreenshotParagraphsIndividually(
+                        batch.paragraphs,
+                        provider: provider,
+                        source: source,
+                        target: target
+                    ),
+                    uniquingKeysWith: { _, latest in latest }
+                )
+            }
+        }
+        finishScreenshotTranslation(request: request, translations: translations)
+    }
+
+    /// Some traditional machine translation services rewrite or remove custom
+    /// paragraph separators. Retry that batch one paragraph at a time, paced to
+    /// stay under common entry-level QPS limits, instead of surfacing a parsing
+    /// error to the user.
+    private func translateScreenshotParagraphsIndividually(
+        _ paragraphs: [ScreenshotTranslationBatch.Paragraph],
+        provider: any TranslationProvider,
+        source: SupportedLanguage,
+        target: SupportedLanguage
+    ) async throws -> [UUID: String] {
+        var translations: [UUID: String] = [:]
+        for paragraph in paragraphs {
+            try await Task.sleep(nanoseconds: 1_100_000_000)
+            try Task.checkCancellation()
+            let result = try await provider.translate(TranslationRequest(
+                text: paragraph.protectedText.text,
+                sourceLanguage: source,
+                targetLanguage: target,
+                purpose: .screenshotParagraph
+            ))
+            let text = paragraph.protectedText.restoring(in: result.text)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { throw HelloXError.invalidResponse }
+            translations[paragraph.id] = text
+        }
+        return translations
+    }
+
+    private func finishScreenshotTranslation(
+        request: ScreenshotTranslationRequest,
+        translations: [UUID: String]
+    ) {
+        guard screenshotTranslationOperationID == request.id else { return }
+        do {
+            let sourceByID = Dictionary(uniqueKeysWithValues: request.paragraphs.map {
+                ($0.id, $0.text)
+            })
+            let normalizedTranslations = Dictionary(uniqueKeysWithValues: translations.map { entry in
+                (
+                    entry.key,
+                    ScreenshotTranslationOutputNormalizer.normalize(
+                        entry.value,
+                        sourceText: sourceByID[entry.key] ?? "",
+                        targetLanguageIdentifier: request.targetLanguageIdentifier
+                    )
+                )
+            })
+            let sourceImage = try originalSelectionImage()
+            let appearances = ScreenshotTranslationAppearanceExtractor.appearances(
+                for: request.paragraphs.flatMap(\.blocks),
+                in: sourceImage
+            )
+            let imageSize = CGSize(
+                width: CGFloat(sourceImage.width),
+                height: CGFloat(sourceImage.height)
+            )
+            let blocks = ScreenshotTranslationComposer.blocks(
+                paragraphs: request.paragraphs,
+                translations: normalizedTranslations,
+                appearances: appearances,
+                imageSize: imageSize
+            )
+            guard !blocks.isEmpty else { throw HelloXError.invalidResponse }
+            let reconstructedBackground = try ScreenshotTranslationBackgroundReconstructor.eraseText(
+                in: sourceImage,
+                normalizedRegions: blocks.flatMap(\.backgroundRegions)
+            )
+            screenshotTranslationBackgroundImage = reconstructedBackground
+            screenshotTranslationBlocks = blocks
+            screenshotTranslationError = nil
+            showsScreenshotTranslation = true
+            isPerformingOCR = false
+            isPerformingTranslation = false
+            pendingScreenshotTranslationRequest = nil
+            screenshotTranslationTask = nil
+            screenshotTranslationOperationID = nil
+            dirty = true
+        } catch {
+            failScreenshotTranslation(error, operationID: request.id)
+        }
+    }
+
+    private func failScreenshotTranslation(_ error: Error, operationID: UUID) {
+        guard screenshotTranslationOperationID == operationID else { return }
+        screenshotTranslationTask = nil
+        screenshotTranslationOperationID = nil
+        isPerformingOCR = false
+        isPerformingTranslation = false
+        pendingScreenshotTranslationRequest = nil
+        screenshotTranslationError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+    }
+
+    private func confirmCloudScreenshotTranslationIfNeeded() -> Bool {
+        let key = "did-confirm-cloud-screenshot-translation"
+        guard !UserDefaults.standard.bool(forKey: key) else { return true }
+        guard let profile = appModel.defaultTextTranslationProfile else { return false }
+        let alert = HelloXAlert()
+        alert.messageText = "允许发送识别文字？"
+        alert.informativeText = "HelloX 只会把本地 OCR 识别出的文字发送给“\(profile.name)”翻译，不会上传截图。"
+        alert.addButton(withTitle: "允许并继续")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else { return false }
+        UserDefaults.standard.set(true, forKey: key)
+        return true
     }
 
     func renderedImage() throws -> CGImage {
@@ -296,11 +442,15 @@ final class EditorDocument: ObservableObject {
             guard let outputCrop else { return image }
             return try AnnotationRenderer.crop(baseImage: image, normalizedRect: outputCrop)
         case .annotatedOutput:
+            let translatedBackground = showsScreenshotTranslation
+                ? screenshotTranslationBackgroundImage
+                : nil
             return try AnnotationRenderer.renderOutput(
                 baseImage: image,
                 annotations: annotations,
                 normalizedCrop: outputCrop,
-                translatedBlocks: imageTranslationBlocks
+                replacementBaseImage: translatedBackground,
+                screenshotTranslationBlocks: showsScreenshotTranslation ? screenshotTranslationBlocks : []
             )
         }
     }
@@ -352,16 +502,6 @@ final class EditorDocument: ObservableObject {
         NSPasteboard.general.clearContents()
         if NSPasteboard.general.setString(text, forType: .string) {
             CopyFeedbackPresenter.shared.showSuccess("识别文字已复制")
-        } else {
-            CopyFeedbackPresenter.shared.showFailure()
-        }
-    }
-
-    func copyTranslation() {
-        guard let translatedText else { return }
-        NSPasteboard.general.clearContents()
-        if NSPasteboard.general.setString(translatedText, forType: .string) {
-            CopyFeedbackPresenter.shared.showSuccess("译文已复制")
         } else {
             CopyFeedbackPresenter.shared.showFailure()
         }
@@ -423,68 +563,6 @@ final class EditorDocument: ObservableObject {
         }
     }
 
-    private func imageForOutput() throws -> CGImage { try originalSelectionImage() }
-
-    /// Keeps each OCR line in its original geometry while using the largest
-    /// single font size that every translated line in a paragraph can contain.
-    /// This preserves the screenshot's layout and prevents adjacent lines from
-    /// looking arbitrarily larger or smaller after translation.
-    private func makeImageTranslationBlocks(
-        paragraphs: [RecognizedTextParagraph],
-        translations: [UUID: String],
-        appearances: [UUID: ImageTranslationAppearance],
-        imageSize: CGSize
-    ) -> [ImageTranslationBlock] {
-        paragraphs.flatMap { paragraph in
-            guard let translation = translations[paragraph.id] else { return [ImageTranslationBlock]() }
-            let sourceBlocks = paragraph.blocks.sorted(by: VisionOCRService.readingOrder)
-            let fragments = OCRParagraphLayout.distribute(translation, across: sourceBlocks)
-            guard fragments.count == sourceBlocks.count else { return [ImageTranslationBlock]() }
-
-            let sourceAppearances = sourceBlocks.map { appearances[$0.id] ?? .fallback }
-            let preferredSize = sourceAppearances.map(\.fontSize).sorted()[sourceAppearances.count / 2]
-            let sharedSize = zip(sourceBlocks, fragments).map { sourceBlock, fragment in
-                ImageTranslationTextLayout.fittedFontSize(
-                    for: fragment,
-                    in: pixelRect(for: sourceBlock.boundingBox, imageSize: imageSize),
-                    preferredSize: preferredSize
-                )
-            }.min() ?? preferredSize
-
-            return zip(zip(sourceBlocks, fragments), sourceAppearances).map { pair, sourceAppearance in
-                let (sourceBlock, fragment) = pair
-                return ImageTranslationBlock(
-                    id: sourceBlock.id,
-                    text: fragment,
-                    boundingBox: sourceBlock.boundingBox,
-                    appearance: ImageTranslationAppearance(
-                        fontSize: sharedSize,
-                        foregroundColor: sourceAppearance.foregroundColor,
-                        backgroundColor: sourceAppearance.backgroundColor,
-                        lineCount: sourceAppearance.lineCount
-                    )
-                )
-            }
-        }
-    }
-
-    private func pixelRect(for boundingBox: CGRect, imageSize: CGSize) -> CGRect {
-        let box = boundingBox.standardized.intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
-        return CGRect(
-            x: box.minX * imageSize.width,
-            y: (1 - box.maxY) * imageSize.height,
-            width: box.width * imageSize.width,
-            height: box.height * imageSize.height
-        ).integral
-    }
-
-    private func applyImageTranslations(_ blocks: [ImageTranslationBlock]) {
-        imageTranslationBlocks = blocks
-        translatedText = blocks.map(\.text).joined(separator: "\n")
-        isPerformingTranslation = false
-        pendingImageTranslationRequest = nil
-        dirty = true
-    }
 
     private func applyCopyResult(_ result: PasteboardWriteResult) {
         switch result {

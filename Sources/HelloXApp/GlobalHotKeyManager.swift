@@ -1,15 +1,17 @@
 @preconcurrency import Carbon
 import Foundation
+import HelloXCore
 
 final class GlobalHotKeyManager: @unchecked Sendable {
     private var hotKeyRefs: [ShortcutAction: EventHotKeyRef] = [:]
     private var activeBindings: [ShortcutAction: ShortcutBinding] = [:]
     private var handlerRef: EventHandlerRef?
     private(set) var initialRegistrationError: ShortcutRegistrationError?
-    private let handler: @Sendable (ShortcutAction) -> Void
+    private let handler: @MainActor @Sendable (ShortcutAction, [CaptureResult]) -> Void
+    private let immediateCapturer = ScreenCaptureService()
     private static let signature: OSType = 0x4D534854 // MSHT
 
-    init(handler: @escaping @Sendable (ShortcutAction) -> Void) {
+    init(handler: @escaping @MainActor @Sendable (ShortcutAction, [CaptureResult]) -> Void) {
         self.handler = handler
         installEventHandler()
         if case .failure(let error) = apply(ShortcutPreferences.load()) {
@@ -124,6 +126,35 @@ final class GlobalHotKeyManager: @unchecked Sendable {
         return ShortcutAction.allCases[index]
     }
 
+    private func captureVisibleFrameIfNeeded(for action: ShortcutAction) -> [CaptureResult] {
+        switch action {
+        case .regionCapture, .fullScreenCapture, .captureAndOCR, .captureAndTranslate:
+            immediateCapturer.captureVisibleDisplaysImmediately(excludingOwnApplication: false)
+        default:
+            []
+        }
+    }
+
+    private func dispatch(
+        _ action: ShortcutAction,
+        initialCaptures: [CaptureResult]
+    ) {
+        let perform = { @MainActor in
+            self.handler(action, initialCaptures)
+        }
+        if Thread.isMainThread {
+            MainActor.assumeIsolated(perform)
+        } else {
+            // The visible frame is already frozen at this point. Never wait
+            // synchronously for the main thread here: Carbon can deliver a
+            // hot-key while AppKit is inside a menu-tracking loop, and a sync
+            // hop can deadlock the application until that loop exits.
+            Task { @MainActor [handler] in
+                handler(action, initialCaptures)
+            }
+        }
+    }
+
     private func installEventHandler() {
         var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
         InstallEventHandler(
@@ -143,7 +174,11 @@ final class GlobalHotKeyManager: @unchecked Sendable {
                 let manager = Unmanaged<GlobalHotKeyManager>.fromOpaque(userData).takeUnretainedValue()
                 guard status == noErr, id.signature == GlobalHotKeyManager.signature,
                       let action = manager.action(for: id.id) else { return OSStatus(eventNotHandledErr) }
-                manager.handler(action)
+                // Freeze transient windows before returning from the Carbon
+                // callback. Once this handler returns, the source app's menu
+                // tracking loop is free to dismiss its context menu.
+                let initialCaptures = manager.captureVisibleFrameIfNeeded(for: action)
+                manager.dispatch(action, initialCaptures: initialCaptures)
                 return noErr
             },
             1,

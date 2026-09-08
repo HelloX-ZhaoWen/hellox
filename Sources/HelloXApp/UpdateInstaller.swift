@@ -108,15 +108,18 @@ struct UpdateInstaller {
         backup='\(backup.path)'
         trash='\(trashDirectory.path)/HelloX-backup-\(UUID().uuidString).app'
         while kill -0 "$pid" 2>/dev/null; do sleep 0.2; done
-        /bin/mv "$source" "$backup"
-        [[ "$source" == "$target" ]] || /bin/rm -rf "$target"
-        if /bin/mv "$staged" "$target"; then
+        # 备份当前应用，用于失败时回滚
+        /bin/cp -a "$source" "$backup"
+        # 原地覆盖：保留 /Applications/HelloX.app 路径不变，维持 TCC 权限映射
+        if /bin/ditto --norsrc --keepParent "$staged" "$target"; then
           /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$target" >/dev/null 2>&1 || true
           /usr/bin/open -n "$target"
           /bin/mv "$backup" "$trash"
           /bin/rm -f "$0"
           exit 0
         fi
+        # 覆盖失败，回滚到备份版本
+        /bin/rm -rf "$target"
         /bin/mv "$backup" "$target"
         exit 1
         """
