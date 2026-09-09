@@ -43,7 +43,7 @@ struct IntelligenceSettingsView: View {
                     Text("翻译服务").font(HXTypography.section)
                     Spacer(minLength: 12)
                     HXDropdownMenu("添加翻译服务", actions:
-                        [TranslationVendor.zhipu, .volcengine, .niutrans].map { vendor in
+                        [TranslationVendor.zhipu, .baidu, .aliyun, .volcengine, .niutrans].map { vendor in
                             HXDropdownAction(vendor.displayName, image: TranslationServiceIcon.image(for: vendor)) {
                                 editingProfile = TranslationProfile.preset(vendor)
                             }
@@ -138,6 +138,7 @@ struct TranslationProfileEditor: View {
     @State private var failed = false
     @State private var isTesting = false
     @State private var testTask: Task<Void, Never>?
+    @State private var showsSetupGuide = false
 
     private var isExisting: Bool { model.translationProfiles.contains { $0.id == profile.id } }
 
@@ -161,13 +162,30 @@ struct TranslationProfileEditor: View {
                         }
                         .padding(16)
                     }
+                    if let description = profile.vendor.freeQuotaDescription {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("官方免费说明")
+                                .font(HXTypography.body)
+                            Text(description)
+                                .font(HXTypography.caption)
+                                .foregroundStyle(HXTextStyle.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                            HStack(spacing: 12) {
+                                Button("申请教程") { showsSetupGuide = true }
+                                if let url = profile.vendor.registrationURL {
+                                    Link("开通服务 / 获取凭证", destination: url)
+                                }
+                            }
+                            .font(HXTypography.caption)
+                        }
+                    }
                     HXSettingsGroup(title: "凭证") {
                         VStack(alignment: .leading, spacing: 16) {
-                            if profile.vendor == .volcengine {
+                            if [.volcengine, .aliyun].contains(profile.vendor) {
                                 HXFormField("Access Key ID", text: optionBinding("accessKeyID"),
                                             placeholder: "输入 Access Key ID")
                             }
-                            if profile.vendor == .niutrans {
+                            if [.niutrans, .baidu].contains(profile.vendor) {
                                 HXFormField("APPID", text: optionBinding("appID"), placeholder: "输入 APPID")
                             }
                             HXFormField(credentialTitle, text: $apiKey,
@@ -211,13 +229,18 @@ struct TranslationProfileEditor: View {
             .padding(.top, 12)
             .padding(.bottom, 20)
         }
-        .font(HXTypography.body).frame(width: 560, height: 480)
+        .font(HXTypography.body).frame(width: 560, height: profile.vendor.freeQuotaDescription == nil ? 480 : 600)
         // The sheet owns the outer clipping; a second rounded surface exposes
         // the system backing at the corners when their radii differ.
         .background(HXDialogStyle.background(colorScheme))
         .foregroundStyle(HXTextStyle.primary)
         .buttonStyle(HXDialogButtonStyle())
         .onDisappear { testTask?.cancel() }
+        .sheet(isPresented: $showsSetupGuide) {
+            TranslationSetupGuideView(vendor: profile.vendor)
+                .presentationBackground(HXDialogStyle.background(colorScheme))
+                .presentationCornerRadius(HXDialogStyle.radius)
+        }
     }
 
     private func deleteProfile() {
@@ -233,7 +256,7 @@ struct TranslationProfileEditor: View {
     }
 
     private var credentialTitle: String {
-        profile.vendor == .volcengine ? "Secret Access Key" : "API Key"
+        profile.vendor.credentialTitle
     }
 
     private func optionBinding(_ key: String) -> Binding<String> {
@@ -266,5 +289,68 @@ struct TranslationProfileEditor: View {
                 failed = true; message = error.localizedDescription
             }
         }
+    }
+}
+
+struct TranslationSetupGuideView: View {
+    let vendor: TranslationVendor
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HXDialogHeader(title: "密钥申请教程", subtitle: vendor.displayName, onClose: { dismiss() })
+            ScrollView {
+                if let guide = vendor.setupGuide {
+                    VStack(alignment: .leading, spacing: 24) {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("申请步骤").font(HXTypography.section)
+                            ForEach(Array(guide.steps.enumerated()), id: \.offset) { index, step in
+                                HStack(alignment: .top, spacing: 10) {
+                                    Text("\(index + 1).")
+                                        .foregroundStyle(HXTextStyle.secondary)
+                                        .frame(width: 18, alignment: .leading)
+                                    Text(step).fixedSize(horizontal: false, vertical: true)
+                                }
+                            }
+                            HStack(spacing: 12) {
+                                Link("开通服务 / 获取凭证", destination: guide.registrationURL)
+                                Link("官方操作指南", destination: guide.instructionsURL)
+                            }
+                        }
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("官方免费说明").font(HXTypography.section)
+                            Text(guide.freePolicy).fixedSize(horizontal: false, vertical: true)
+                            Text("核对日期：" + TranslationSetupGuide.verifiedDate + " · 最新规则以官方为准")
+                                .font(HXTypography.caption).foregroundStyle(HXTextStyle.secondary)
+                            Link("查看官方额度与计费说明", destination: guide.pricingURL)
+                        }
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("确认配置成功").font(HXTypography.section)
+                            Text("返回配置页，点击「测试连接」。出现「连接成功」后保存，再启用该服务；需要默认使用时，在「默认云端服务」中选择它。")
+                                .fixedSize(horizontal: false, vertical: true)
+                            Text("测试会发送真实翻译请求并按服务商规则消耗额度。HelloX 不读取剩余额度，也不会在免费额度耗尽时自动停用服务。")
+                                .font(HXTypography.caption).foregroundStyle(HXTextStyle.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    .padding(.horizontal, 20).padding(.bottom, 16)
+                    .textSelection(.enabled)
+                }
+            }
+            .codexScrollChrome()
+            HStack {
+                Spacer()
+                Button("返回配置") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                    .buttonStyle(HXDialogButtonStyle(primary: true))
+            }
+            .padding(20)
+        }
+        .frame(width: 560, height: 640)
+        .font(HXTypography.body)
+        .foregroundStyle(HXTextStyle.primary)
+        .background(HXDialogStyle.background(colorScheme))
+        .buttonStyle(HXDialogButtonStyle())
     }
 }

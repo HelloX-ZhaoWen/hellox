@@ -361,19 +361,35 @@ public enum ScreenshotTranslationOutputNormalizer {
     public static func normalize(
         _ translatedText: String,
         sourceText: String,
-        targetLanguageIdentifier: String
+        targetLanguageIdentifier: String,
+        sourceContext: [String] = []
     ) -> String {
         let source = ScreenshotTranslationContentPolicy.textForTranslation(sourceText)
+        let target = targetLanguageIdentifier.lowercased()
+        guard target == "zh" || target.hasPrefix("zh-") else { return translatedText }
+        let traditional = target.contains("hant") || target.contains("tw") || target.contains("hk")
+        // Standalone words such as "Sent" and "More" are ambiguous to text
+        // translators. Only apply mailbox terminology when the surrounding
+        // independent labels establish that context; never rewrite prose.
+        let context = Set(sourceContext.map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        })
+        if context.contains("inbox"),
+           !context.isDisjoint(with: ["starred", "snoozed"]),
+           !context.isDisjoint(with: ["sent", "drafts"]) {
+            let terms = traditional
+                ? ["inbox": "收件匣", "starred": "已加星號", "snoozed": "已延後",
+                   "sent": "寄件備份", "drafts": "草稿", "categories": "類別", "more": "更多"]
+                : ["inbox": "收件箱", "starred": "已加星标", "snoozed": "已延后",
+                   "sent": "已发送", "drafts": "草稿", "categories": "类别", "more": "更多"]
+            if let label = terms[source.lowercased()] { return label }
+        }
         guard source.range(
             of: #"(?i)\b(?:left|remaining)\s+\d{1,3}:\d{2}(?::\d{2})?\b"#,
             options: .regularExpression
         ) != nil else { return translatedText }
 
-        let target = targetLanguageIdentifier.lowercased()
-        guard target == "zh" || target.hasPrefix("zh-") else { return translatedText }
-        let remaining = target.contains("hant") || target.contains("tw") || target.contains("hk")
-            ? "剩餘 "
-            : "剩余 "
+        let remaining = traditional ? "剩餘 " : "剩余 "
         guard let expression = try? NSRegularExpression(
             pattern: #"(?:向\s*)?左(?:侧|側)?\s*[:：]?\s*(?=\d{1,3}:\d{2}(?::\d{2})?)"#
         ) else { return translatedText }

@@ -846,7 +846,7 @@ enum MarkdownWorkspaceMode: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
-private final class MarkdownLocalImageSchemeHandler: NSObject, WKURLSchemeHandler {
+final class MarkdownLocalImageSchemeHandler: NSObject, WKURLSchemeHandler {
     private static let maximumConcurrentLoadCount = 3
     private static let maximumQueuedLoadCount = 128
 
@@ -1056,10 +1056,12 @@ private final class MarkdownLocalImageSchemeHandler: NSObject, WKURLSchemeHandle
 }
 
 @MainActor
-final class MarkdownPreviewModel: NSObject, ObservableObject, WKNavigationDelegate {
+final class MarkdownPreviewModel: NSObject, ObservableObject, WKNavigationDelegate, WKScriptMessageHandler {
     let webView: WKWebView
     private let localImageSchemeHandler: MarkdownLocalImageSchemeHandler
     private var renderKey = ""
+    private var imageBaseURL: URL?
+    let imageOverlay = MarkdownWindowImageOverlay()
 
     override init() {
         let configuration = WKWebViewConfiguration()
@@ -1075,9 +1077,10 @@ final class MarkdownPreviewModel: NSObject, ObservableObject, WKNavigationDelega
             forURLScheme: MarkdownLocalImageScheme.name
         )
         self.localImageSchemeHandler = localImageSchemeHandler
-        webView = WKWebView(frame: .zero, configuration: configuration)
+        webView = MarkdownPreviewWebView(frame: .zero, configuration: configuration)
         super.init()
         webView.navigationDelegate = self
+        configuration.userContentController.add(MarkdownImageMessageHandler(target: self), name: "hxOpenImageViewer")
         webView.underPageBackgroundColor = .clear
         webView.allowsMagnification = true
         webView.magnification = 1
@@ -1094,8 +1097,20 @@ final class MarkdownPreviewModel: NSObject, ObservableObject, WKNavigationDelega
         )
         let key = "\(baseURL?.path ?? "")\u{0}\(html)"
         guard key != renderKey else { return }
+        imageOverlay.dismiss()
+        imageBaseURL = baseURL
         renderKey = key
         webView.loadHTMLString(html, baseURL: nil)
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        (webView as? MarkdownPreviewWebView)?.updateImageViewerScope()
+    }
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard message.webView === webView, message.frameInfo.isMainFrame,
+              let gallery = message.body as? [String: Any], let window = webView.window else { return }
+        imageOverlay.present(gallery: gallery, in: window, source: webView, baseURL: imageBaseURL)
     }
 
     func scroll(to headingID: String) {
@@ -1103,6 +1118,7 @@ final class MarkdownPreviewModel: NSObject, ObservableObject, WKNavigationDelega
     }
 
     func pdfData() async throws -> Data {
+        imageOverlay.dismiss()
         try await waitUntilDocumentIsReady()
         _ = try await webView.evaluateJavaScript("document.getElementById('hx-image-viewer')?.close(); true;")
         let configuration = WKPDFConfiguration()

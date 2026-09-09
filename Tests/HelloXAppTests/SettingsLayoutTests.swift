@@ -261,8 +261,11 @@ struct SettingsLayoutTests {
         defer { app.appearance = savedAppearance }
         for scheme in [ColorScheme.light, .dark] {
             app.appearance = NSAppearance(named: scheme == .dark ? .darkAqua : .aqua)
-            for vendor in [TranslationVendor.zhipu, .volcengine, .niutrans] {
-                let content = TranslationProfileEditor(profile: .preset(vendor), apiKey: "")
+            for (vendor, isGuide) in [TranslationVendor.zhipu, .volcengine, .niutrans, .baidu, .aliyun].flatMap({ [($0, false), ($0, true)] }) {
+                let content = Group {
+                    if isGuide { TranslationSetupGuideView(vendor: vendor) }
+                    else { TranslationProfileEditor(profile: .preset(vendor), apiKey: "") }
+                }
                     .environmentObject(AppModel(translationProfileState: .init(
                         profiles: [], defaultProfileID: nil, apiKeys: [:], isOfflineTranslationEnabled: false
                     )))
@@ -281,7 +284,7 @@ struct SettingsLayoutTests {
                 let bitmap = try #require(view.bitmapImageRepForCachingDisplay(in: view.bounds))
                 view.cacheDisplay(in: view.bounds, to: bitmap)
                 let png = try #require(bitmap.representation(using: .png, properties: [:]))
-                try png.write(to: output.appendingPathComponent("translation-editor-\(vendor.rawValue)-\(scheme == .dark ? "dark" : "light").png"))
+                try png.write(to: output.appendingPathComponent("translation-\(isGuide ? "guide" : "editor")-\(vendor.rawValue)-\(scheme == .dark ? "dark" : "light").png"))
             }
         }
     }

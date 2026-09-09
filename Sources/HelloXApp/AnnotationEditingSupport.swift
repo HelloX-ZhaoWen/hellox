@@ -1402,6 +1402,25 @@ enum AnnotationInlineEditingPolicy {
     }
 }
 
+private final class AnnotationInputTextView: NSTextView {
+    private var needsInitialFocus = true
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        // SwiftUI can create this view before attaching it to the capture
+        // panel. Request keyboard focus after attachment, not after creation.
+        guard needsInitialFocus, let window else { return }
+        DispatchQueue.main.async { [weak self, weak window] in
+            guard let self, let window, self.window === window,
+                  self.needsInitialFocus else { return }
+            window.makeKey()
+            guard window.makeFirstResponder(self) else { return }
+            self.needsInitialFocus = false
+            self.setSelectedRange(NSRange(location: self.string.utf16.count, length: 0))
+        }
+    }
+}
+
 private struct InlineGrowingTextView: NSViewRepresentable {
     @Binding var text: String
     let font: NSFont
@@ -1414,7 +1433,7 @@ private struct InlineGrowingTextView: NSViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
 
     func makeNSView(context: Context) -> NSTextView {
-        let textView = NSTextView(frame: .zero)
+        let textView = AnnotationInputTextView(frame: .zero)
         textView.delegate = context.coordinator
         textView.string = text
         textView.font = font
@@ -1437,11 +1456,6 @@ private struct InlineGrowingTextView: NSViewRepresentable {
             height: 100_000
         )
         textView.textStorage?.delegate = context.coordinator
-        DispatchQueue.main.async { [weak textView] in
-            guard let textView else { return }
-            textView.window?.makeFirstResponder(textView)
-            textView.setSelectedRange(NSRange(location: textView.string.utf16.count, length: 0))
-        }
         return textView
     }
 

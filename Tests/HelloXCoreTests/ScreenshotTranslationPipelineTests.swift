@@ -1,9 +1,116 @@
+import AppKit
 import CoreGraphics
 import Foundation
 import Testing
 @testable import HelloXCore
 
 struct ScreenshotTranslationPipelineTests {
+    @MainActor
+    @Test func bottomAnchoredTranslationKeepsAllInkInsideImage() throws {
+        // These fractional OCR boxes used to round past the bitmap bottom.
+        // Draw onto a taller transparent canvas to detect pixels that an
+        // actual image export would silently discard.
+        for (height, boxHeight) in [(31, 12.8), (46, 12.1), (77, 11.4)] {
+            let context = try #require(CGContext(
+                data: nil, width: 260, height: 200, bitsPerComponent: 8, bytesPerRow: 1040,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                    | CGBitmapInfo.byteOrder32Big.rawValue
+            ))
+            context.translateBy(x: 0, y: 200)
+            context.scaleBy(x: 1, y: -1)
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: true)
+            let block = ScreenshotTranslationBlock(
+                id: UUID(), sourceText: "Click to view more feature details",
+                translatedText: "点击查看更多功能详情",
+                boundingBox: CGRect(x: 0.1, y: 0, width: 0.8, height: boxHeight / Double(height)),
+                appearance: .fallback
+            )
+            ScreenshotTranslationDrawing.draw(
+                [block], in: CGRect(x: 0, y: 0, width: 260, height: height),
+                sourceImageSize: CGSize(width: 260, height: height)
+            )
+            NSGraphicsContext.restoreGraphicsState()
+            let data = try #require(context.data).assumingMemoryBound(to: UInt8.self)
+            let hasInk = (0..<height).contains { y in
+                (0..<260).contains { x in data[(y * 260 + x) * 4 + 3] > 0 }
+            }
+            let clippedInk = (height..<200).contains { y in
+                (0..<260).contains { x in data[(y * 260 + x) * 4 + 3] > 0 }
+            }
+            #expect(hasInk)
+            #expect(!clippedInk)
+        }
+    }
+
+    @Test func mailSidebarTranslationPreservesRowsAndUsesConsistentType() {
+        let labels = ["Inbox", "Starred", "Snoozed", "Sent", "Drafts", "Categories", "More"]
+        let heights: [CGFloat] = [12, 16.48, 14.67, 12, 12.52, 18, 12]
+        let tops: [CGFloat] = [22, 51.76, 83.69, 118, 149.74, 182, 214]
+        let widths: [CGFloat] = [42, 52.15, 58.16, 32, 44.14, 74, 34]
+        let source = labels.indices.map { index in
+            block(labels[index], x: 14 / 136, y: 1 - (tops[index] + heights[index]) / 242,
+                  width: widths[index] / 136, height: heights[index] / 242)
+        }
+        let paragraphs = OCRParagraphLayout.paragraphs(from: source)
+        let translations = Dictionary(uniqueKeysWithValues: paragraphs.map {
+            ($0.id, ScreenshotTranslationOutputNormalizer.normalize(
+                "译文", sourceText: $0.text, targetLanguageIdentifier: "zh-Hans", sourceContext: labels
+            ))
+        })
+        let appearances = Dictionary(uniqueKeysWithValues: source.indices.map { index in
+            (source[index].id, ScreenshotTranslationAppearance(
+                fontSize: heights[index],
+                foregroundColor: index == 0 ? RGBAColor(red: 0, green: 0.2, blue: 0.4) : .black,
+                backgroundColor: index == 0 ? RGBAColor(red: 0.82, green: 0.88, blue: 1) : .white
+            ))
+        })
+        let composed = ScreenshotTranslationComposer.blocks(
+            paragraphs: paragraphs, translations: translations, appearances: appearances,
+            imageSize: CGSize(width: 136, height: 242)
+        )
+        #expect(composed.count == 7)
+        #expect(Set(composed.map { $0.appearance.fontSize }).count == 1)
+        for (result, original) in zip(composed, source) {
+            #expect(result.sourceLineCount == 1)
+            #expect(abs(result.boundingBox.maxY - original.boundingBox.maxY) < 0.0001)
+            #expect(result.backgroundBoxes == [original.boundingBox])
+            let rect = CGRect(x: 0, y: 0, width: result.boundingBox.width * 136,
+                              height: result.boundingBox.height * 242).integral
+            #expect(ScreenshotTranslationTextLayout.fitsCompletely(
+                result.translatedText, in: rect, fontSize: result.appearance.fontSize, maximumLineCount: 1
+            ))
+        }
+        for (upper, lower) in zip(composed, composed.dropFirst()) {
+            #expect(upper.boundingBox.minY > lower.boundingBox.maxY)
+        }
+    }
+
+    @Test func usesMailboxTerminologyOnlyWithMailboxContext() {
+        let labels = ["Inbox", "Starred", "Snoozed", "Sent", "Drafts", "Categories", "More"]
+        let expected = ["收件箱", "已加星标", "已延后", "已发送", "草稿", "类别", "更多"]
+        for (source, translation) in zip(labels, expected) {
+            #expect(ScreenshotTranslationOutputNormalizer.normalize(
+                "错误译文", sourceText: source, targetLanguageIdentifier: "zh-Hans",
+                sourceContext: labels
+            ) == translation)
+        }
+        #expect(ScreenshotTranslationOutputNormalizer.normalize(
+            "更多的", sourceText: "More", targetLanguageIdentifier: "zh-Hans"
+        ) == "更多的")
+        #expect(ScreenshotTranslationOutputNormalizer.normalize(
+            "已发送更多草稿", sourceText: "Sent more drafts", targetLanguageIdentifier: "zh-Hans",
+            sourceContext: labels
+        ) == "已发送更多草稿")
+        #expect(ScreenshotTranslationOutputNormalizer.normalize(
+            "Envoyés", sourceText: "Sent", targetLanguageIdentifier: "fr", sourceContext: labels
+        ) == "Envoyés")
+        #expect(ScreenshotTranslationOutputNormalizer.normalize(
+            "發送", sourceText: "Sent", targetLanguageIdentifier: "zh-Hant", sourceContext: labels
+        ) == "寄件備份")
+    }
+
     @Test func recognizesStepBadgeOCRMarkers() {
         for marker in ["2", "2)", "(2)", "（3）", "V", "V)", "v", "C", "*", "✓", "く", "<"] {
             #expect(VisionOCRService.isStepControlMarkerToken(marker))

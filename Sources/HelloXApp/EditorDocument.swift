@@ -260,7 +260,7 @@ final class EditorDocument: ObservableObject {
         source: SupportedLanguage,
         target: SupportedLanguage
     ) async throws {
-        guard appModel.defaultTextTranslationProfile != nil else {
+        guard let profile = appModel.defaultTextTranslationProfile else {
             throw HelloXError.invalidConfiguration("请启用离线翻译，或配置一个云端翻译服务")
         }
         guard confirmCloudScreenshotTranslationIfNeeded() else {
@@ -272,7 +272,10 @@ final class EditorDocument: ObservableObject {
                 text: ScreenshotTranslationContentPolicy.textForTranslation($0.text)
             )
         }
-        let batches = try ScreenshotTranslationBatchCodec.batches(for: paragraphTexts)
+        let batches = try ScreenshotTranslationBatchCodec.batches(
+            for: paragraphTexts,
+            maximumCharacterCount: profile.vendor.maximumRequestCharacterCount
+        )
         guard let firstBatch = batches.first else { throw HelloXError.noTextFound }
         let seedRequest = TranslationRequest(
             text: firstBatch.text,
@@ -364,7 +367,8 @@ final class EditorDocument: ObservableObject {
                     ScreenshotTranslationOutputNormalizer.normalize(
                         entry.value,
                         sourceText: sourceByID[entry.key] ?? "",
-                        targetLanguageIdentifier: request.targetLanguageIdentifier
+                        targetLanguageIdentifier: request.targetLanguageIdentifier,
+                        sourceContext: request.paragraphs.map(\.text)
                     )
                 )
             })

@@ -24,6 +24,8 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
             minimumSize: NSSize(width: 760, height: 520)
         )
         HelloXWindowStyle.applyDialog(to: window)
+        // Canvas drags edit the image; only the document bar moves the window.
+        window.isMovableByWindowBackground = false
         window.setContentSize(NSSize(width: 1080, height: 720))
         super.init(window: window)
         window.delegate = self

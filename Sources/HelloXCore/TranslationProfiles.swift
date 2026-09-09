@@ -5,6 +5,8 @@ public enum TranslationVendor: String, CaseIterable, Codable, Sendable, Identifi
     case volcengine
     case zhipu
     case niutrans
+    case baidu
+    case aliyun
 
     public var id: String { rawValue }
 
@@ -14,6 +16,8 @@ public enum TranslationVendor: String, CaseIterable, Codable, Sendable, Identifi
         case .volcengine: "火山机器翻译"
         case .zhipu: "智谱免费翻译"
         case .niutrans: "小牛翻译"
+        case .baidu: "百度翻译"
+        case .aliyun: "阿里云翻译"
         }
     }
 
@@ -23,6 +27,8 @@ public enum TranslationVendor: String, CaseIterable, Codable, Sendable, Identifi
         case .volcengine: "https://translate.volcengineapi.com"
         case .zhipu: "https://open.bigmodel.cn/api/paas/v4/chat/completions"
         case .niutrans: "https://api.niutrans.com/v2/text/translate"
+        case .baidu: "https://fanyi-api.baidu.com/api/trans/vip/translate"
+        case .aliyun: "https://mt.cn-hangzhou.aliyuncs.com"
         }
     }
 
@@ -36,6 +42,20 @@ public enum TranslationVendor: String, CaseIterable, Codable, Sendable, Identifi
     public var requiresModel: Bool { self == .zhipu }
     public var requiresAPIKey: Bool { self != .local }
     public var supportsTextTranslation: Bool { self != .local }
+    public var maximumRequestCharacterCount: Int { self == .baidu ? 1_000 : 5_000 }
+
+    public var credentialTitle: String {
+        switch self {
+        case .volcengine: "Secret Access Key"
+        case .aliyun: "AccessKey Secret"
+        case .baidu: "密钥"
+        case .niutrans: "APIKEY"
+        default: "API Key"
+        }
+    }
+
+    public var freeQuotaDescription: String? { setupGuide?.freePolicy }
+    public var registrationURL: URL? { setupGuide?.registrationURL }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
@@ -91,8 +111,8 @@ public struct TranslationProfile: Codable, Equatable, Sendable, Identifiable {
             throw HelloXError.invalidConfiguration("配置名称不能为空")
         }
         if vendor != .local {
-            guard let url = URL(string: baseURL) else { throw HelloXError.invalidConfiguration("Base URL 无效") }
-            if [.volcengine, .niutrans].contains(vendor),
+            guard let url = URL(string: baseURL), url.host?.isEmpty == false else { throw HelloXError.invalidConfiguration("Base URL 无效") }
+            if [.volcengine, .niutrans, .baidu, .aliyun].contains(vendor),
                url.scheme?.lowercased() != "https" {
                 throw HelloXError.invalidConfiguration("\(vendor.displayName)必须使用 HTTPS")
             }
@@ -100,22 +120,16 @@ public struct TranslationProfile: Codable, Equatable, Sendable, Identifiable {
         if vendor.requiresModel && model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             throw HelloXError.invalidConfiguration("请填写模型名称")
         }
-        if vendor == .volcengine,
+        if [.volcengine, .aliyun].contains(vendor),
            options["accessKeyID"]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
             throw HelloXError.invalidConfiguration("请填写 Access Key ID")
         }
-        if vendor == .niutrans,
+        if [.niutrans, .baidu].contains(vendor),
            options["appID"]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
             throw HelloXError.invalidConfiguration("请填写 APPID")
         }
         if vendor.requiresAPIKey && !hasAPIKey {
-            let credentialName: String
-            switch vendor {
-            case .volcengine: credentialName = "Secret Access Key"
-            case .niutrans: credentialName = "APIKEY"
-            default: credentialName = "API Key"
-            }
-            throw HelloXError.invalidConfiguration("请填写 \(credentialName)")
+            throw HelloXError.invalidConfiguration("请填写 \(vendor.credentialTitle)")
         }
     }
 }
@@ -146,6 +160,10 @@ public enum TranslationProviderFactory {
                 configuration: ZhipuTranslationConfiguration(baseURL: URL(string: profile.baseURL)!, model: profile.model, apiKey: key),
                 session: session
             )
+        case .baidu:
+            return BaiduTranslationProvider(profile: profile, apiKey: key, session: session)
+        case .aliyun:
+            return AliyunTranslationProvider(profile: profile, apiKey: key, session: session)
         case .niutrans:
             return NiuTransTranslationProvider(
                 configuration: NiuTransTranslationConfiguration(

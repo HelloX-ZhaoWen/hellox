@@ -340,7 +340,7 @@ struct MarkdownPreviewTests {
         let zoomed = try await model.webView.evaluateJavaScript("""
         (() => {
           const viewer = document.getElementById('hx-image-viewer');
-          viewer.querySelector('button').click();
+          viewer.querySelector('[data-action=original]').click();
           return viewer.classList.contains('hx-original');
         })();
         """) as? Bool
@@ -361,6 +361,114 @@ struct MarkdownPreviewTests {
         #expect(pdf.starts(with: Data("%PDF".utf8)))
         #expect(try await model.webView.evaluateJavaScript("!document.getElementById('hx-image-viewer').open") as? Bool == true)
         #expect(!MarkdownHTMLConverter.convert("![Image](image.png)").contains("hx-image-viewer"))
+    }
+
+    @Test @MainActor func imageGalleryNavigatesScalesRotatesAndRestoresDocument() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("HelloX-ImageGallery-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try makePNGData(width: 1200, height: 900).write(to: directory.appendingPathComponent("first.png"))
+        try makePNGData(width: 400, height: 800).write(to: directory.appendingPathComponent("second.png"))
+        let model = MarkdownPreviewModel()
+        model.webView.setFrameSize(NSSize(width: 800, height: 600))
+        model.render(markdown: "![First](first.png)\n\n![Second](second.png)", title: "Gallery", baseURL: directory)
+        #expect(try await waitForLoadedImageCount(in: model.webView, expected: 2) == 2)
+        let result = try await model.webView.evaluateJavaScript("""
+        (() => {
+          document.images[0].click();
+          const viewer = document.getElementById('hx-image-viewer');
+          const button = action => viewer.querySelector('[data-action="' + action + '"]');
+          const label = () => viewer.querySelector('.hx-image-scale').textContent;
+          const counter = () => viewer.querySelector('.hx-image-counter').textContent;
+          const checks = [counter() === '1/2', button('previous').disabled,
+                          !button('next').disabled, parseInt(label()) < 100];
+          button('original').click();
+          checks.push(label() === '100%');
+          button('zoom-in').click();
+          checks.push(label() === '125%', viewer.classList.contains('hx-pannable'));
+          button('zoom-out').click();
+          checks.push(label() === '100%');
+          button('next').click();
+          checks.push(counter() === '2/2', button('next').disabled,
+                      viewer.querySelector('img').alt === 'Second');
+          button('rotate').click();
+          checks.push(viewer.querySelector('img').style.transform.includes('rotate(90deg)'));
+          viewer.dispatchEvent(new KeyboardEvent('keydown', {key:'ArrowLeft', bubbles:true}));
+          checks.push(counter() === '1/2', viewer.querySelector('img').alt === 'First',
+                      viewer.querySelector('img').style.transform.includes('rotate(0deg)'));
+          button('fit').click();
+          const stage = viewer.querySelector('.hx-image-stage').getBoundingClientRect();
+          const image = viewer.querySelector('img').getBoundingClientRect();
+          checks.push(image.width <= stage.width + 1, image.height <= stage.height + 1);
+          viewer.querySelector('.hx-image-stage').click();
+          checks.push(!viewer.open);
+          return checks;
+        })();
+        """) as? [Bool]
+        #expect(result == Array(repeating: true, count: 18))
+        // Wait for the dialog's asynchronous close event before checking cleanup.
+        for _ in 0..<50 {
+            if try await model.webView.evaluateJavaScript("document.documentElement.style.overflow !== 'hidden'") as? Bool == true {
+                break
+            }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        #expect(try await model.webView.evaluateJavaScript("document.documentElement.style.overflow !== 'hidden' && document.activeElement === document.images[0]") as? Bool == true)
+    }
+
+    @Test @MainActor func imageOverlayCoversWindowChromeAndRestoresPreview() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("HelloX-WindowImageViewer-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try makePNGData(width: 1200, height: 900).write(to: directory.appendingPathComponent("image.png"))
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1000, height: 760),
+                              styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
+                              backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        let content = try #require(window.contentView)
+        let model = MarkdownPreviewModel()
+        defer { model.imageOverlay.dismiss(); window.close() }
+        // Reproduce the inset document column, leaving native header/sidebar space.
+        model.webView.frame = NSRect(x: 240, y: 30, width: 730, height: 540)
+        content.addSubview(model.webView)
+        model.render(markdown: "# Manual\n![Image](image.png)\n" + String(repeating: "Text\n\n", count: 100),
+                     title: "Window overlay", baseURL: directory)
+        #expect(try await waitForImageSize(in: model.webView) == [1200, 900])
+        for _ in 0..<100 {
+            if try await model.webView.evaluateJavaScript("window.hxUsesWindowImageViewer === true") as? Bool == true { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        _ = try await model.webView.evaluateJavaScript("document.documentElement.style.scrollBehavior = 'auto'; window.scrollTo(0, 120); document.images[0].click();")
+        for _ in 0..<100 {
+            if let overlayWebView = model.imageOverlay.webView, !overlayWebView.isLoading,
+               try await overlayWebView.evaluateJavaScript("document.getElementById('hx-image-viewer')?.open === true") as? Bool == true { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let overlay = try #require(model.imageOverlay.container)
+        let overlayWebView = try #require(model.imageOverlay.webView)
+        #expect(overlay.superview === content)
+        #expect(content.subviews.last === overlay)
+        #expect(overlay.frame == content.bounds)
+        #expect(overlayWebView.frame == overlay.bounds)
+        #expect(overlay.frame.width > model.webView.frame.width)
+        #expect(overlay.frame.height > model.webView.frame.height)
+        #expect(window.standardWindowButton(.closeButton)?.isHidden == true)
+        #expect(try await model.webView.evaluateJavaScript("!document.getElementById('hx-image-viewer').open") as? Bool == true)
+        #expect(try await waitForImageSize(in: overlayWebView) == [1200, 900])
+        window.setContentSize(NSSize(width: 1150, height: 850))
+        #expect(overlay.frame == content.bounds)
+        #expect(overlayWebView.frame == overlay.bounds)
+        _ = try await overlayWebView.evaluateJavaScript("document.getElementById('hx-image-viewer').dispatchEvent(new KeyboardEvent('keydown', {key:'Escape', bubbles:true}));")
+        for _ in 0..<100 {
+            if model.imageOverlay.container == nil { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        #expect(model.imageOverlay.container == nil)
+        #expect(window.standardWindowButton(.closeButton)?.isHidden == false)
+        #expect(model.webView.superview === content)
+        #expect(try await model.webView.evaluateJavaScript("window.scrollY") as? Int == 120)
     }
 
     @MainActor

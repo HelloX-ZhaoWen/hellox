@@ -21,7 +21,7 @@ HelloX 将截图、标注、文字提取、翻译和日常小工具整合到一�
 | 截图与长截图 | 区域、窗口、全屏截图；手动滚动捕获长页面，自动拼接内容 |
 | 图片标注 | 矩形、高亮、椭圆、箭头、画笔、文字、步骤编号、马赛克、裁剪与水印 |
 | 文字提取 | 基于 Apple Vision 识别图片文字，方便复制和继续编辑 |
-| 多种翻译入口 | 文本翻译、截图翻译、划词翻译；支持本地离线、火山机器翻译、智谱和小牛翻译 |
+| 多种翻译入口 | 文本翻译、截图翻译、划词翻译；支持本地离线、智谱、百度、阿里云、火山机器翻译和小牛翻译 |
 | 图片置顶 | 将图片悬浮置顶，便于对照资料与跨窗口工作 |
 | 选区录屏 | 录制指定屏幕区域并保存为 MP4；当前版本不录制音频 |
 | Mac 灵动岛 | 屏幕顶部的应用与工具入口；展开后切换运行中应用，一键启动全部 16 项 HelloX 功能，支持应用置顶、功能排序和全屏空间显示 |
@@ -84,7 +84,7 @@ HelloX 灵动岛将运行中应用与效率工具集中在屏幕顶部。收起�
 
 **系统要求：macOS 15 或更高版本，Apple Silicon 或 Intel Mac。**
 
-当前版本：**v1.0.4（构建 97）**。查看[更新说明](docs/releases/v1.0.4.md)，或直接下载 [DMG 安装镜像](https://github.com/HelloX-ZhaoWen/hellox/releases/download/v1.0.4/HelloX-1.0.4.dmg) / [PKG 安装包](https://github.com/HelloX-ZhaoWen/hellox/releases/download/v1.0.4/HelloX-1.0.4.pkg)。
+当前版本：**v1.0.5（构建 98）**。查看[更新说明](docs/releases/v1.0.5.md)，或直接下载 [DMG 安装镜像](https://github.com/HelloX-ZhaoWen/hellox/releases/download/v1.0.5/HelloX-1.0.5.dmg) / [PKG 安装包](https://github.com/HelloX-ZhaoWen/hellox/releases/download/v1.0.5/HelloX-1.0.5.pkg)。
 
 此版本未经过 Apple 公证；首次安装时，macOS 可能要求在“系统设置 → 隐私与安全性”中确认。
 
@@ -112,6 +112,23 @@ HelloX 灵动岛将运行中应用与效率工具集中在屏幕顶部。收起�
 - **OCR 与翻译**：使用“文字提取”识别图片内容；使用“截图翻译”处理屏幕文字，或选中文字后触发“划词翻译”。云端服务需先在“翻译设置”中配置。
 - **Markdown**：打开“Markdown 转换”工具并导入文档，也可以在访达中右键 `.md` 文件，选择“打开方式 → HelloX”。从“文件”菜单保存或导出。
 - **打开设置**：在 HelloX 中按 `⌘ ,`，或从菜单栏打开“设置”。普通工作窗口打开时显示 Dock 图标，关闭这些窗口后仍可通过菜单栏和灵动岛使用应用。
+
+### 国内免费额度翻译
+
+五家云翻译的申请步骤、字段对照和官方免费说明，见[云翻译密钥申请教程](docs/translation-setup-guide.md)。配置页也可点击「申请教程」查看。
+
+在“设置 → 翻译服务 → 添加翻译服务”中选择服务，填写自己的凭证，点击“测试连接”，保存后启用。文本翻译、划词翻译和截图翻译共用服务配置；默认不会替你开通或启用新增云端服务。
+
+| 本次新增服务 | 免费额度（2026-09-09 核实） | 配置凭证 | HelloX 单次限制 |
+| --- | --- | --- | --- |
+| [百度翻译开放平台](https://fanyi-api.baidu.com/access/0) | 标准版每月 5 万字符；个人认证高级版每月 100 万字符 | APPID、密钥 | 1000 字符，支持常见语种 |
+| [阿里云机器翻译通用版](https://mt.console.aliyun.com/) | 每月 100 万字符，主账号与子账号共享 | Access Key ID、AccessKey Secret | 5000 字符 |
+
+“免费额度”不是无限免费。百度超额按平台规则收费；阿里云免费额度耗尽后自动进入按量付费。HelloX 不读取服务商账户的剩余额度，也不保证阻止服务商计费；请在控制台关注用量。最新规则见[百度接入与版本说明](https://fanyi-api.baidu.com/doc/13)、[阿里云定价](https://help.aliyun.com/zh/machine-translation/product-overview/billing-overview)。阿里云需要开通通用版机器翻译，并为使用的 RAM 凭证授予 `alimt:TranslateGeneral` 权限。
+
+有道仅提供一次性体验金，耗尽后收费，因此本次未加入，见[有道文本翻译定价](https://ai.youdao.com/DOCSIRMA/html/transapi/trans/price/wbfy/index.html)。腾讯云已公告从 2026-10-01 起停止发放新免费资源包，本次也未加入，见[官方公告](https://cloud.tencent.cn/announce/detail/2448)。
+
+实现使用官方 HTTPS API，百度通过 MD5 签名，阿里云通过 RPC HMAC-SHA1 签名；自动识别源语言、返回多段译文及服务商鉴权 / 限流 / 额度错误均接入现有翻译流程。测试使用固定签名样例和模拟网络响应，真实账户连通性需填写凭证后通过“测试连接”验证。
 
 ### 默认快捷键
 

@@ -483,6 +483,20 @@ public enum ScreenshotTranslationInteractionPolicy {
 }
 
 public enum ScreenshotTranslationTextLayout {
+    static func pixelAlignedRect(for boundingBox: CGRect, in destination: CGRect) -> CGRect {
+        let box = boundingBox.standardized.intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
+        guard !box.isNull else { return .zero }
+        // Rounding a normalized bottom edge can expand the rectangle by one
+        // pixel beyond the image. Fit against the actual drawable area, not
+        // that extra pixel which the export bitmap will inevitably clip.
+        return CGRect(
+            x: destination.minX + box.minX * destination.width,
+            y: destination.minY + (1 - box.maxY) * destination.height,
+            width: box.width * destination.width,
+            height: box.height * destination.height
+        ).integral.intersection(destination)
+    }
+
     public static func insets(for fontSize: CGFloat) -> NSEdgeInsets {
         NSEdgeInsets(
             top: max(0.10, fontSize * 0.015),
@@ -652,13 +666,7 @@ public enum ScreenshotTranslationDrawing {
     }
 
     private static func displayRect(for boundingBox: CGRect, in destination: CGRect) -> CGRect {
-        let box = boundingBox.standardized.intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
-        return CGRect(
-            x: destination.minX + box.minX * destination.width,
-            y: destination.minY + (1 - box.maxY) * destination.height,
-            width: box.width * destination.width,
-            height: box.height * destination.height
-        ).integral
+        ScreenshotTranslationTextLayout.pixelAlignedRect(for: boundingBox, in: destination)
     }
 }
 
@@ -675,7 +683,8 @@ public enum ScreenshotTranslationComposer {
     ) -> [ScreenshotTranslationBlock] {
         let resolvedParagraphSizes = paragraphStyleSizes(
             paragraphs: paragraphs,
-            appearances: appearances
+            appearances: appearances,
+            imageSize: imageSize
         )
         let prepared = paragraphs.compactMap { paragraph -> PreparedParagraph? in
             guard let translation = translations[paragraph.id],
@@ -827,13 +836,9 @@ public enum ScreenshotTranslationComposer {
     }
 
     private static func pixelRect(for boundingBox: CGRect, imageSize: CGSize) -> CGRect {
-        let box = boundingBox.standardized.intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
-        return CGRect(
-            x: box.minX * imageSize.width,
-            y: (1 - box.maxY) * imageSize.height,
-            width: box.width * imageSize.width,
-            height: box.height * imageSize.height
-        ).integral
+        ScreenshotTranslationTextLayout.pixelAlignedRect(
+            for: boundingBox, in: CGRect(origin: .zero, size: imageSize)
+        )
     }
 
     private static func median(_ values: [CGFloat]) -> CGFloat {
@@ -848,7 +853,8 @@ public enum ScreenshotTranslationComposer {
 
     private static func paragraphStyleSizes(
         paragraphs: [RecognizedTextParagraph],
-        appearances: [UUID: ScreenshotTranslationAppearance]
+        appearances: [UUID: ScreenshotTranslationAppearance],
+        imageSize: CGSize
     ) -> [UUID: CGFloat] {
         let detailedEntries = paragraphs.map { paragraph in
             let paragraphAppearances = paragraph.blocks.map {
@@ -925,6 +931,39 @@ public enum ScreenshotTranslationComposer {
                     resolved[entry.id] = max(resolved[entry.id] ?? entry.size, rowSize)
                 }
             }
+        }
+
+        // Vertically stacked menu labels also share a font. Ink-box heights
+        // vary with ascenders/descenders, and selected rows may use different
+        // text and fill colors, so identify the column by alignment and spacing.
+        let textByID = Dictionary(uniqueKeysWithValues: paragraphs.map { ($0.id, $0.text) })
+        var columns: [[ParagraphStyleEntry]] = []
+        for entry in rowEntries.sorted(by: { $0.boundingBox.midY > $1.boundingBox.midY }) {
+            guard let text = textByID[entry.id], text.count <= 32,
+                  text.split(whereSeparator: { $0.isWhitespace }).count <= 3,
+                  text.last.map({ !".!?;:。！？；：".contains($0) }) == true else { continue }
+            let box = pixelRect(for: entry.boundingBox, imageSize: imageSize)
+            if let index = columns.indices.first(where: { index in
+                guard let previous = columns[index].last else { return false }
+                let upper = pixelRect(for: previous.boundingBox, imageSize: imageSize)
+                let height = max(upper.height, box.height)
+                let gap = box.minY - upper.maxY
+                let sizes = columns[index].map(\.size) + [entry.size]
+                return abs(upper.minX - box.minX) <= max(2, height * 0.25)
+                    && gap > height * 0.45 && gap <= height * 2.4
+                    && (sizes.max() ?? 1) / max(0.25, sizes.min() ?? 1) <= 1.6
+                    && !OCRSemanticContinuity.isContinuous(
+                        previous: textByID[previous.id] ?? "", current: text
+                    )
+            }) {
+                columns[index].append(entry)
+            } else {
+                columns.append([entry])
+            }
+        }
+        for column in columns where column.count >= 4 {
+            let size = median(column.map(\.size))
+            for entry in column { resolved[entry.id] = size }
         }
         return resolved
     }

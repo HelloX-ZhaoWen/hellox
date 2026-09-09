@@ -473,6 +473,14 @@ public enum TextParagraphCorrector {
         let gap = upper.minY - lower.maxY
         let gapRatio = gap / max(0.0001, height)
         let alignedLeftEdge = abs(left.boundingBox.minX - right.boundingBox.minX) <= height * 1.4
+        // A stack of compact navigation labels has its own row spacing. On a
+        // sidebar-only crop that spacing becomes the document's "normal" gap,
+        // so the relative paragraph-gap threshold alone joins unrelated items.
+        let independentLabels = left.blocks.count == 1 && right.blocks.count == 1
+            && isCompactLabel(leftText) && isCompactLabel(rightText)
+            && alignedLeftEdge && gapRatio > 0.45
+            && !semanticallyContinuous
+        if independentLabels { return true }
         let compactTitleWithSupportingCopy = leftText.count <= 32
             && leftText.split(whereSeparator: { $0.isWhitespace }).count <= 3
             && rightText.count > leftText.count
@@ -539,6 +547,12 @@ public enum TextParagraphCorrector {
 
     private static func horizontalGap(_ lhs: CGRect, _ rhs: CGRect) -> CGFloat {
         max(lhs.minX, rhs.minX) - min(lhs.maxX, rhs.maxX)
+    }
+
+    private static func isCompactLabel(_ text: String) -> Bool {
+        text.count <= 32
+            && text.split(whereSeparator: { $0.isWhitespace }).count <= 3
+            && !endsSentence(text)
     }
 
     private static func isPlausibleInlineGap(

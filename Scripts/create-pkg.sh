@@ -34,4 +34,10 @@ fi
   "${SIGN_ARGS[@]}" \
   "$PKG_PATH"
 
+(
+  cd "$PROJECT_ROOT/build"
+  /usr/bin/shasum -a 256 "HelloX-$VERSION.pkg" > "HelloX-$VERSION.pkg.sha256"
+)
+
 echo "Created $PKG_PATH"
+echo "Created $PKG_PATH.sha256"

@@ -39,8 +39,9 @@ struct TranslationServiceIcon: View {
 
     static func image(for vendor: TranslationVendor) -> NSImage? {
         guard let resourceName = resourceName(for: vendor) else { return nil }
-        let url = HelloXResourceBundle.bundle.url(forResource: resourceName, withExtension: "svg", subdirectory: "VendorIcons")
-            ?? HelloXResourceBundle.bundle.url(forResource: resourceName, withExtension: "svg")
+        let fileExtension = [.baidu, .aliyun].contains(vendor) ? "ico" : "svg"
+        let url = HelloXResourceBundle.bundle.url(forResource: resourceName, withExtension: fileExtension, subdirectory: "VendorIcons")
+            ?? HelloXResourceBundle.bundle.url(forResource: resourceName, withExtension: fileExtension)
         let image = url.flatMap(NSImage.init(contentsOf:))
         image?.isTemplate = false
         return image
@@ -49,6 +50,8 @@ struct TranslationServiceIcon: View {
     private static func resourceName(for vendor: TranslationVendor) -> String? {
         switch vendor {
         case .local: nil
+        case .baidu: "baidu"
+        case .aliyun: "aliyun"
         case .volcengine: "volcengine"
         case .zhipu: "zhipu"
         case .niutrans: "niutrans"

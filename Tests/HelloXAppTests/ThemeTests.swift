@@ -7,7 +7,8 @@ import Testing
 struct ThemeTests {
     @MainActor
     @Test func translationVendorsHaveReadableColorArtwork() throws {
-        for vendor in [TranslationVendor.volcengine, .niutrans, .zhipu] {
+        let vendors = TranslationVendor.allCases.filter { $0 != .local }
+        for vendor in vendors {
             let image = try #require(TranslationServiceIcon.image(for: vendor))
             #expect(image.isValid)
             #expect(!image.isTemplate)
@@ -16,7 +17,7 @@ struct ThemeTests {
         #expect(TranslationServiceIcon.image(for: .local) == nil)
         if let directory = ProcessInfo.processInfo.environment["HELLOX_UI_SNAPSHOTS"] {
             let content = VStack(alignment: .leading, spacing: 16) {
-                ForEach([TranslationVendor.volcengine, .niutrans, .zhipu], id: \.self) { vendor in
+                ForEach(vendors, id: \.self) { vendor in
                     HStack(spacing: 12) {
                         TranslationServiceIcon(vendor: vendor, size: 32, logoSize: 24)
                         Text(vendor.displayName)

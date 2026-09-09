@@ -198,6 +198,7 @@ struct EditorView: View {
         .padding(.horizontal, 20)
         .frame(height: 64)
         .background(HelloXTheme.surface(for: colorScheme))
+        .gesture(WindowDragGesture())
         .overlay(alignment: .bottom) {
             Rectangle()
                 .fill(HelloXTheme.border(for: colorScheme))

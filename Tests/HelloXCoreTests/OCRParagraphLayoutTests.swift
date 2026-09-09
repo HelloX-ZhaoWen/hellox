@@ -3,6 +3,40 @@ import Testing
 @testable import HelloXCore
 
 struct OCRParagraphLayoutTests {
+    @Test func preservesMailSidebarRowsWithUnevenOCRInkHeights() {
+        // Measured from the reported 136 x 242 sidebar screenshot.
+        let labels = ["Inbox", "Starred", "Snoozed", "Sent", "Drafts", "Categories", "More"]
+        let heights: [CGFloat] = [12, 16.48, 14.67, 12, 12.52, 18, 12]
+        let tops: [CGFloat] = [22, 51.76, 83.69, 118, 149.74, 182, 214]
+        let widths: [CGFloat] = [42, 52.15, 58.16, 32, 44.14, 74, 34]
+        let blocks = labels.indices.map { index in
+            block(labels[index], x: 14 / 136, y: 1 - (tops[index] + heights[index]) / 242,
+                  width: widths[index] / 136, height: heights[index] / 242)
+        }
+        let paragraphs = OCRParagraphLayout.paragraphs(from: blocks)
+        #expect(paragraphs.map(\.text) == labels)
+        #expect(paragraphs.map(\.boundingBox) == blocks.map(\.boundingBox))
+    }
+
+    @Test func compactLabelsDoNotMergeAtOrdinarySidebarSpacing() {
+        let blocks = [
+            block("Inbox", x: 0.1, y: 0.8, width: 0.12, height: 0.05),
+            block("Starred", x: 0.1, y: 0.72, width: 0.15, height: 0.05),
+            block("Snoozed", x: 0.1, y: 0.64, width: 0.16, height: 0.05),
+            block("Drafts", x: 0.1, y: 0.56, width: 0.12, height: 0.05),
+            block("Categories", x: 0.1, y: 0.48, width: 0.20, height: 0.05)
+        ]
+        #expect(OCRParagraphLayout.paragraphs(from: blocks).map(\.text) == blocks.map(\.text))
+    }
+
+    @Test func compactWrappedSentenceStillJoins() {
+        let blocks = [
+            block("Waiting for", x: 0.1, y: 0.8, width: 0.15, height: 0.05),
+            block("your reply", x: 0.1, y: 0.72, width: 0.14, height: 0.05)
+        ]
+        #expect(OCRParagraphLayout.paragraphs(from: blocks).count == 1)
+    }
+
     @Test func isolatedTableHeaderCellsNeverMerge() {
         let cells = [
             block("Product\nImage", x: 0.12, y: 0.22, width: 0.07, height: 0.49, isolated: true),

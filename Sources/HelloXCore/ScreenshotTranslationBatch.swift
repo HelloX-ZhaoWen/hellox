@@ -24,8 +24,7 @@ public struct ScreenshotTranslationBatch: Sendable {
 }
 
 public enum ScreenshotTranslationBatchCodec {
-    /// All currently supported cloud translation providers accept at least
-    /// 5,000 characters per request.
+    /// Default for cloud providers; callers pass smaller vendor-specific limits.
     public static let defaultMaximumCharacterCount = 5_000
 
     public static func batches(
@@ -48,7 +47,7 @@ public enum ScreenshotTranslationBatchCodec {
         for paragraph in protectedParagraphs {
             let candidate = current + [paragraph]
             let candidateText = encodedText(for: candidate)
-            if candidateText.count <= maximumCharacterCount {
+            if candidateText.utf16.count <= maximumCharacterCount {
                 current = candidate
                 continue
             }
@@ -58,7 +57,7 @@ public enum ScreenshotTranslationBatchCodec {
             }
             result.append(.init(paragraphs: current, text: encodedText(for: current)))
             current = [paragraph]
-            guard encodedText(for: current).count <= maximumCharacterCount else {
+            guard encodedText(for: current).utf16.count <= maximumCharacterCount else {
                 throw HelloXError.invalidConfiguration("截图中的单个段落超过云端翻译长度限制")
             }
         }

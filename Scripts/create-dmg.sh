@@ -20,7 +20,10 @@ rm -f "$DMG_PATH"
 /bin/mkdir -p "$STAGING_ROOT/.update"
 /usr/bin/ditto "$APP_ROOT" "$STAGING_ROOT/.update/HelloX.app"
 /usr/bin/hdiutil create -volname HelloX -srcfolder "$STAGING_ROOT" -ov -format UDZO "$DMG_PATH"
-/usr/bin/shasum -a 256 "$DMG_PATH" > "$DMG_PATH.sha256"
+(
+  cd "$PROJECT_ROOT/build"
+  /usr/bin/shasum -a 256 "HelloX-$VERSION.dmg" > "HelloX-$VERSION.dmg.sha256"
+)
 
 echo "Created $DMG_PATH"
 echo "Created $DMG_PATH.sha256"
