@@ -240,6 +240,7 @@ enum HelloXIconKey: String, CaseIterable {
     case code = "code"
     case password = "key"
     case markdown = "markdown"
+    case diagram = "workflow"
     case chevronUp = "chevron-up"
     case chevronDown = "chevron-down"
     case accessibility = "accessibility"

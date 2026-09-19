@@ -804,11 +804,16 @@ final class AppModel: ObservableObject {
         let markdownURLs = urls.filter {
             markdownExtensions.contains($0.pathExtension.lowercased())
         }
-        guard !markdownURLs.isEmpty else {
-            CopyFeedbackPresenter.shared.showFailure("HelloX 当前可直接打开 Markdown 文档")
-            return
+        let diagramURLs = urls.filter { $0.pathExtension.lowercased() == "hxdiagram" }
+        if !markdownURLs.isEmpty {
+            utilityToolController(for: .markdown).openMarkdownDocuments(at: markdownURLs)
         }
-        utilityToolController(for: .markdown).openMarkdownDocuments(at: markdownURLs)
+        if let diagramURL = diagramURLs.first {
+            utilityToolController(for: .mindMap).openDiagramDocument(at: diagramURL)
+        }
+        if markdownURLs.isEmpty, diagramURLs.isEmpty {
+            CopyFeedbackPresenter.shared.showFailure("HelloX 当前可直接打开 Markdown 或 .hxdiagram 文档")
+        }
     }
 
     private func utilityToolController(for tool: UtilityTool) -> UtilityToolWindowController {

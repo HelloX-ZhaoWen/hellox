@@ -99,7 +99,7 @@ struct SettingsLayoutTests {
                 case .base64: minimumSize = NSSize(width: 700, height: 440)
                 case .password: minimumSize = NSSize(width: 600, height: 300)
                 case .colorPicker: minimumSize = NSSize(width: 380, height: 320)
-                case .markdown: minimumSize = NSSize(width: 900, height: 580)
+                case .markdown, .mindMap: minimumSize = NSSize(width: 900, height: 580)
                 }
                 let sizes: [(String, NSSize)] = [
                     ("", normalSize), ("-minimum", minimumSize),
@@ -118,7 +118,7 @@ struct SettingsLayoutTests {
                     let png = try #require(bitmap.representation(using: .png, properties: [:]))
                     try png.write(to: output.appendingPathComponent("tool-\(tool.rawValue)-\(scheme)\(suffix).png"))
                     #expect(window.titleVisibility == .hidden)
-                    #expect(window.standardWindowButton(.closeButton)?.isHidden == (tool != .markdown))
+                    #expect(window.standardWindowButton(.closeButton)?.isHidden == (tool != .markdown && !tool.isDiagramEditor))
                     #expect(view.bounds.width >= minimumSize.width)
                     #expect(view.bounds.height >= minimumSize.height)
                 }

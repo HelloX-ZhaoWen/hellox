@@ -65,6 +65,7 @@
 | `undo-2` | `arrow-uturn-left-light-16` | Codex native | Original SVG geometry and canvas | `/webview/assets/app-initial-cadb12d4a15e.js` |
 | `upload` | `arrow-up-line-horizontal-light-20` | Codex native | Original SVG geometry and canvas | `/webview/assets/app-initial-cadb12d4a15e.js` |
 | `watermark` | `Droplet` | Codex bundled Lucide | Original geometry; stroke 2 -> 1.6 on the 24-unit canvas to match native Codex light optical width | `/webview/assets/droplet-DL7qoUmf-d4d38d057231.js` |
+| `workflow` | HelloX 流程连接 | HelloX original | 24 单位画布，1.6 单位统一描边 | 本项目原创 |
 | `x` | `xmark-md-light-20` | Codex native | Original SVG geometry and canvas | `/webview/assets/app-initial-cadb12d4a15e.js` |
 
 ## 语义说明

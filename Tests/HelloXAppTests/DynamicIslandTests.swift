@@ -263,9 +263,23 @@ struct DynamicIslandTests {
     }
 
     @Test func exposesEveryHelloXActionToTheIsland() {
-        #expect(ShortcutAction.configurableCases.count == 16)
-        #expect(Set(ShortcutAction.configurableCases) == Set(ShortcutAction.allCases))
+        #expect(ShortcutAction.configurableCases.count == 17)
+        #expect(!ShortcutAction.configurableCases.contains(.diagram))
+        #expect(!ShortcutAction.configurableCases.contains(.flowchart))
+        #expect(ShortcutAction.configurableCases.contains(.mindMap))
         #expect(ShortcutAction.configurableCases.allSatisfy { !$0.title.isEmpty })
+    }
+
+    @Test func retiredFlowchartBindingsAreRemovedWithoutLosingMindMapOrCaptureBindings() throws {
+        let binding = try #require(ShortcutAction.regionCapture.defaultBinding)
+        let persisted: [ShortcutAction: ShortcutBinding] = [
+            .diagram: binding, .flowchart: binding, .mindMap: binding, .regionCapture: binding
+        ]
+        let decoded = try JSONDecoder().decode([ShortcutAction: ShortcutBinding].self,
+            from: JSONEncoder().encode(persisted))
+        let cleaned = ShortcutPreferences.removingRetiredActions(from: decoded)
+        #expect(cleaned == [.mindMap: binding, .regionCapture: binding])
+        #expect(!UtilityTool.allCases.map(\.rawValue).contains("flowchart"))
     }
 
     @Test func everyCaptureEntryPointRequestsIslandSuppression() {

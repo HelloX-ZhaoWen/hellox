@@ -60,6 +60,8 @@ final class HelloXActionDispatcher {
         case .colorPicker: model.showUtilityTool(.colorPicker)
         case .password: model.showUtilityTool(.password)
         case .markdown: model.showUtilityTool(.markdown)
+        case .mindMap: model.showUtilityTool(.mindMap)
+        case .diagram, .flowchart: break // Retired actions cannot open an editor.
         }
     }
 }

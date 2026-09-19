@@ -18,6 +18,10 @@ enum ShortcutAction: String, CaseIterable, Codable, Sendable, Identifiable {
     case colorPicker
     case password
     case markdown
+    // Retired actions are decoded only to preserve other saved shortcut bindings.
+    case diagram
+    case flowchart
+    case mindMap
 
     static let configurableCases: [ShortcutAction] = [
         .regionCapture,
@@ -35,7 +39,8 @@ enum ShortcutAction: String, CaseIterable, Codable, Sendable, Identifiable {
         .qrCode,
         .colorPicker,
         .password,
-        .markdown
+        .markdown,
+        .mindMap
     ]
 
     var id: String { rawValue }
@@ -58,6 +63,9 @@ enum ShortcutAction: String, CaseIterable, Codable, Sendable, Identifiable {
         case .colorPicker: "取色器（颜色代码）"
         case .password: "密码生成（随机）"
         case .markdown: "Markdown 转换"
+        case .diagram: "流程图与脑图（旧入口）"
+        case .flowchart: "流程图"
+        case .mindMap: "脑图"
         }
     }
 
@@ -71,7 +79,8 @@ enum ShortcutAction: String, CaseIterable, Codable, Sendable, Identifiable {
         case .watermarkImage: ShortcutBinding(keyCode: UInt32(kVK_ANSI_W), modifiers: UInt32(optionKey | cmdKey))
         case .captureAndOCR: ShortcutBinding(keyCode: UInt32(kVK_ANSI_O), modifiers: UInt32(optionKey | cmdKey))
         case .translateSelection: ShortcutBinding(keyCode: UInt32(kVK_ANSI_T), modifiers: UInt32(optionKey | cmdKey))
-        case .textTranslation, .captureAndTranslate, .csvToExcel, .base64, .qrCode, .colorPicker, .password, .markdown: nil
+        case .textTranslation, .captureAndTranslate, .csvToExcel, .base64, .qrCode, .colorPicker,
+             .password, .markdown, .diagram, .flowchart, .mindMap: nil
         }
     }
 }
@@ -271,7 +280,7 @@ enum ShortcutPreferences {
         )
     }
 
-    private static func removingRetiredActions(
+    static func removingRetiredActions(
         from bindings: [ShortcutAction: ShortcutBinding]
     ) -> [ShortcutAction: ShortcutBinding] {
         bindings.filter { ShortcutAction.configurableCases.contains($0.key) }
@@ -313,6 +322,7 @@ private enum PersistedShortcutAction: String, Codable {
     case colorPicker
     case password
     case markdown
+    case diagram
 }
 
 struct ShortcutRegistrationError: LocalizedError, Sendable {

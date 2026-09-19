@@ -9,6 +9,7 @@ enum UtilityTool: String, CaseIterable, Hashable {
     case colorPicker
     case password
     case markdown
+    case mindMap
 
     var title: String {
         switch self {
@@ -18,6 +19,7 @@ enum UtilityTool: String, CaseIterable, Hashable {
         case .colorPicker: "取色器"
         case .password: "随机密码"
         case .markdown: "Markdown 转换"
+        case .mindMap: "脑图"
         }
     }
 
@@ -28,9 +30,19 @@ enum UtilityTool: String, CaseIterable, Hashable {
         case .qrCode: "从图片中识别二维码内容"
         case .password: "使用系统安全随机源生成高强度密码"
         case .markdown: "阅读、编辑并导出 Markdown 文档"
+        case .mindMap: "创建、编辑并导出左右布局脑图"
         case .colorPicker: nil
         }
     }
+
+    var diagramKind: DiagramKind? {
+        switch self {
+        case .mindMap: .mindMap
+        default: nil
+        }
+    }
+
+    var isDiagramEditor: Bool { diagramKind != nil }
 
 }
 

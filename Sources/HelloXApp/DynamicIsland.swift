@@ -898,7 +898,7 @@ private struct DynamicIslandView: View {
         HStack(spacing: 8) {
             Text(preferencesStore.value.selectedSection == .menuBar
                  ? overflowService.statusMessage
-                : "16 个 HelloX 功能均可直接启动")
+                : "\(ShortcutAction.configurableCases.count) 个 HelloX 功能均可直接启动")
                 .font(.system(size: 9.5))
                 .foregroundStyle(DynamicIslandTheme.secondaryText)
                 .lineLimit(1)

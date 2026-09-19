@@ -79,6 +79,7 @@ public enum ScreenshotTranslationContentPolicy {
     public static func protectedText(_ text: String) -> ProtectedTranslationText {
         let source = text as NSString
         var ranges: [NSRange] = []
+        ranges.append(contentsOf: captureRanges(in: text, pattern: numericRatioPattern, captureGroup: 0))
         ranges.append(contentsOf: captureRanges(
             in: text,
             pattern: addressPattern,
@@ -240,12 +241,19 @@ public enum ScreenshotTranslationContentPolicy {
     private static let overflowControlPattern = #"^\s*[\p{L}\p{N}]{0,3}\s*(?:…|\.{2,})\s*$"#
     private static let greetingNamePattern = #"(?i)^\s*(?:hi|hello|hey|dear|good\s+morning|good\s+afternoon|good\s+evening)\s+([\p{L}][\p{L}'’.-]*(?:\s+[\p{L}][\p{L}'’.-]*){0,4})(?=\s*[,!:，：！])"#
     private static let leadingSymbolPattern = #"^\s*[^\p{L}\p{N}\s]{1,6}\s+"#
+    private static let numericRatioPattern = #"(?<![\p{L}\p{N}])\d+\s*[/／]\s*\d+(?![\p{L}\p{N}])"#
+
+    static func beginsWithNumericRatio(_ text: String) -> Bool {
+        text.range(of: #"^\s*\d+\s*[/／]\s*\d+\b"#, options: .regularExpression) != nil
+    }
     private static let leadingListPattern = #"^\s*(?:[\(（]\d{1,3}[\)）]|\d{1,3}[.)、）．]|[A-Za-z][.)）．])\s+"#
     private static let leadingControlPattern = #"^\s*(?:0|O|o|V|v|C|c|く|‹|<|\*|○|◯|●|◉|☐|☑|☒|✓|✔|✕|✖|×)\s+"#
     private static let trailingCaretPattern = #"\s+[|｜¦┃│❘丨]+\s*$"#
     private static let trailingControlPattern = #"\s+(?:[=<>⌃⌄↑↓↕↔⇅⇵▲▼△▽⋮⋯]+|[©®™ⓘ]\s*[A-Za-z]?)\s*$"#
 
     private static func leadingMarkerRange(in text: String) -> Range<String.Index>? {
+        // The numerator is content, even when zero resembles a checkbox.
+        guard !beginsWithNumericRatio(text) else { return nil }
         for pattern in [leadingSymbolPattern, leadingListPattern, leadingControlPattern] {
             if let range = text.range(of: pattern, options: .regularExpression) { return range }
         }
@@ -368,6 +376,13 @@ public enum ScreenshotTranslationOutputNormalizer {
         let target = targetLanguageIdentifier.lowercased()
         guard target == "zh" || target.hasPrefix("zh-") else { return translatedText }
         let traditional = target.contains("hant") || target.contains("tw") || target.contains("hk")
+        if let expression = try? NSRegularExpression(
+            pattern: #"(?i)^\s*(\d+)\s*[/／]\s*(\d+)\s+countries?\s+configured\s*$"#
+        ), let match = expression.firstMatch(in: source, range: NSRange(source.startIndex..., in: source)) {
+            let value = source as NSString
+            let ratio = "\(value.substring(with: match.range(at: 1)))/\(value.substring(with: match.range(at: 2)))"
+            return traditional ? "已配置 \(ratio) 個國家" : "已配置 \(ratio) 个国家"
+        }
         // Standalone words such as "Sent" and "More" are ambiguous to text
         // translators. Only apply mailbox terminology when the surrounding
         // independent labels establish that context; never rewrite prose.

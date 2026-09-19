@@ -939,9 +939,8 @@ public enum ScreenshotTranslationComposer {
         let textByID = Dictionary(uniqueKeysWithValues: paragraphs.map { ($0.id, $0.text) })
         var columns: [[ParagraphStyleEntry]] = []
         for entry in rowEntries.sorted(by: { $0.boundingBox.midY > $1.boundingBox.midY }) {
-            guard let text = textByID[entry.id], text.count <= 32,
-                  text.split(whereSeparator: { $0.isWhitespace }).count <= 3,
-                  text.last.map({ !".!?;:。！？；：".contains($0) }) == true else { continue }
+            guard let text = textByID[entry.id],
+                  OCRSemanticContinuity.isCompactLabel(text) else { continue }
             let box = pixelRect(for: entry.boundingBox, imageSize: imageSize)
             if let index = columns.indices.first(where: { index in
                 guard let previous = columns[index].last else { return false }
@@ -950,7 +949,7 @@ public enum ScreenshotTranslationComposer {
                 let gap = box.minY - upper.maxY
                 let sizes = columns[index].map(\.size) + [entry.size]
                 return abs(upper.minX - box.minX) <= max(2, height * 0.25)
-                    && gap > height * 0.45 && gap <= height * 2.4
+                    && gap > height * 0.35 && gap <= height * 2.4
                     && (sizes.max() ?? 1) / max(0.25, sizes.min() ?? 1) <= 1.6
                     && !OCRSemanticContinuity.isContinuous(
                         previous: textByID[previous.id] ?? "", current: text
@@ -1012,8 +1011,13 @@ public enum ScreenshotTranslationAppearanceExtractor {
             let background = pixels.medianColor(around: rect)
             let foreground = pixels.highContrastColor(in: rect, against: background)
                 ?? readableForeground(on: background)
+            // Small badges can have a Vision box much taller than their ink.
+            // Use actual glyph rows to avoid enlarging the translation into
+            // the badge padding. Keep the OCR estimate for uncertain samples.
+            let inkHeight = pixels.inkHeight(in: rect, foreground: foreground, background: background)
+            let sampledSize = inkHeight.map { min(preferredSize, max(8, $0 * 1.1)) } ?? preferredSize
             return (block.id, ScreenshotTranslationAppearance(
-                fontSize: preferredSize,
+                fontSize: sampledSize,
                 foregroundColor: foreground,
                 backgroundColor: RGBAColor(
                     red: background.red,
@@ -1119,6 +1123,26 @@ private struct ScreenshotPixelBuffer {
             green: colors.map(\.green).reduce(0, +) / CGFloat(colors.count),
             blue: colors.map(\.blue).reduce(0, +) / CGFloat(colors.count)
         )
+    }
+
+    func inkHeight(in rect: CGRect, foreground: RGBAColor, background: RGBAColor) -> CGFloat? {
+        var rows: [Int] = []
+        for y in Int(rect.minY)..<Int(rect.maxY) {
+            var matches = 0
+            for x in Int(rect.minX)..<Int(rect.maxX) {
+                let offset = y * bytesPerRow + x * 4
+                let color = RGBAColor(red: CGFloat(data[offset]) / 255,
+                                      green: CGFloat(data[offset + 1]) / 255,
+                                      blue: CGFloat(data[offset + 2]) / 255)
+                if colorDistance(color, foreground) < 0.20, colorDistance(color, background) > 0.16 {
+                    matches += 1
+                }
+            }
+            if matches >= 2 { rows.append(y) }
+        }
+        guard let first = rows.first, let last = rows.last,
+              rows.count >= 6, last - first + 1 <= rows.count + 2 else { return nil }
+        return CGFloat(last - first + 1)
     }
 
     private func colorDistance(_ lhs: RGBAColor, _ rhs: RGBAColor) -> CGFloat {

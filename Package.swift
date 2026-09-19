@@ -33,7 +33,8 @@ let package = Package(
         ),
         .testTarget(
             name: "HelloXCoreTests",
-            dependencies: ["HelloXCore"]
+            dependencies: ["HelloXCore"],
+            resources: [.copy("Fixtures")]
         ),
         .testTarget(
             name: "HelloXAppTests",

@@ -19,6 +19,7 @@ extension ShortcutAction {
         case .colorPicker: .colorPicker
         case .password: .password
         case .markdown: .markdown
+        case .diagram, .flowchart, .mindMap: .diagram
         }
     }
 
@@ -50,6 +51,9 @@ extension ShortcutAction {
         case .colorPicker: "获取屏幕颜色值"
         case .password: "生成安全随机密码"
         case .markdown: "打开 Markdown 工具"
+        case .diagram: "打开旧版图表入口"
+        case .flowchart: "绘制流程图"
+        case .mindMap: "绘制左右布局脑图"
         }
     }
 }

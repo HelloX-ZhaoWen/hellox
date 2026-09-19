@@ -288,7 +288,8 @@ public struct VisionOCRService: TextRecognizing, Sendable {
 
         var contentStartIndex = 0
         let leadingText = String(observation.candidate.string[ranges[0]])
-        if isStepControlMarkerToken(leadingText),
+        if !ScreenshotTranslationContentPolicy.beginsWithNumericRatio(observation.candidate.string),
+           isStepControlMarkerToken(leadingText),
            let markerBox = try? observation.candidate.boundingBox(for: ranges[0])?.boundingBox,
            let nextBox = try? observation.candidate.boundingBox(for: ranges[1])?.boundingBox {
             let markerPixelSize = CGSize(
@@ -376,6 +377,9 @@ public struct VisionOCRService: TextRecognizing, Sendable {
         in observation: TextObservation,
         image: CGImage
     ) -> [RecognizedTextBlock]? {
+        guard !ScreenshotTranslationContentPolicy.beginsWithNumericRatio(observation.candidate.string) else {
+            return nil
+        }
         let ranges = wordRanges(in: observation.candidate.string)
         guard ranges.count >= 4 else { return nil }
         let words = ranges.compactMap { range -> (range: Range<String.Index>, box: CGRect, count: Int)? in

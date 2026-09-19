@@ -7,18 +7,24 @@ import WebKit
 final class UtilityToolWindowController: NSWindowController, NSWindowDelegate {
     let tool: UtilityTool
     private let markdownOpenRouter: MarkdownOpenRouter
+    private let diagramOpenRouter: DiagramOpenRouter
+    private let diagramDocument: DiagramDocumentModel?
     private let colorPickerModel: ColorPickerToolModel?
 
     init(tool: UtilityTool) {
         self.tool = tool
         let markdownOpenRouter = MarkdownOpenRouter()
+        let diagramOpenRouter = DiagramOpenRouter()
+        let diagramDocument = tool.diagramKind.map(DiagramDocumentModel.init(kind:))
         let colorPickerModel = tool == .colorPicker ? ColorPickerToolModel() : nil
         self.markdownOpenRouter = markdownOpenRouter
+        self.diagramOpenRouter = diagramOpenRouter
+        self.diagramDocument = diagramDocument
         self.colorPickerModel = colorPickerModel
         let minimumSize: NSSize
         let initialSize: NSSize
         switch tool {
-        case .markdown:
+        case .markdown, .mindMap:
             minimumSize = NSSize(width: 900, height: 580)
             initialSize = NSSize(width: 1200, height: 800)
         case .colorPicker:
@@ -47,20 +53,26 @@ final class UtilityToolWindowController: NSWindowController, NSWindowDelegate {
         window.minSize = minimumSize
         window.isReleasedWhenClosed = false
         window.collectionBehavior = [.moveToActiveSpace]
-        if tool == .markdown {
+        if tool == .markdown || tool.isDiagramEditor {
             window.collectionBehavior.insert(.fullScreenPrimary)
         }
         window.tabbingMode = .disallowed
         window.center()
         window.contentViewController = HXDialogHostingController(
-            rootView: HXDialogWindowContent(usesNativeWindowControls: tool == .markdown,
+            rootView: HXDialogWindowContent(usesNativeWindowControls: tool == .markdown || tool.isDiagramEditor,
                                            title: tool.title, subtitle: tool.dialogSubtitle,
                                            onClose: { [weak window] in window?.performClose(nil) }) {
-                UtilityToolRootView(tool: tool, markdownOpenRouter: markdownOpenRouter, colorPickerModel: colorPickerModel)
+                UtilityToolRootView(
+                    tool: tool,
+                    markdownOpenRouter: markdownOpenRouter,
+                    diagramOpenRouter: diagramOpenRouter,
+                    diagramDocument: diagramDocument,
+                    colorPickerModel: colorPickerModel
+                )
             }, minimumSize: minimumSize
         )
         HelloXWindowStyle.applyDialog(to: window)
-        if tool == .markdown {
+        if tool == .markdown || tool.isDiagramEditor {
             window.isMovableByWindowBackground = false
             for type in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
                 window.standardWindowButton(type)?.isHidden = false
@@ -99,13 +111,19 @@ final class UtilityToolWindowController: NSWindowController, NSWindowDelegate {
         present()
     }
 
+    func openDiagramDocument(at url: URL) {
+        guard tool.isDiagramEditor else { return }
+        diagramOpenRouter.open(url)
+        present()
+    }
+
     func windowDidResize(_ notification: Notification) {
-        guard tool == .markdown, let window, !window.styleMask.contains(.fullScreen) else { return }
+        guard tool == .markdown || tool.isDiagramEditor, let window, !window.styleMask.contains(.fullScreen) else { return }
         HelloXWindowStyle.positionSettingsWindowControls(in: window, topInset: 26)
     }
 
     func windowDidExitFullScreen(_ notification: Notification) {
-        guard tool == .markdown else { return }
+        guard tool == .markdown || tool.isDiagramEditor else { return }
         DispatchQueue.main.async { [weak self] in
             guard let window = self?.window else { return }
             HelloXWindowStyle.positionSettingsWindowControls(in: window, topInset: 26)
@@ -114,6 +132,47 @@ final class UtilityToolWindowController: NSWindowController, NSWindowDelegate {
 
     func windowWillClose(_ notification: Notification) {
         colorPickerModel?.cancelSampling()
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        guard let diagramDocument, diagramDocument.isModified else { return true }
+        let alert = NSAlert()
+        alert.messageText = "是否保存对图表的更改？"
+        alert.informativeText = "如果不保存，最近的更改将丢失。"
+        alert.addButton(withTitle: "保存")
+        alert.addButton(withTitle: "放弃更改")
+        alert.addButton(withTitle: "取消")
+        alert.alertStyle = .warning
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            return saveDiagramBeforeClosing(diagramDocument)
+        case .alertSecondButtonReturn:
+            diagramDocument.discardChanges()
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func saveDiagramBeforeClosing(_ document: DiagramDocumentModel) -> Bool {
+        var destination = document.fileURL
+        if destination == nil {
+            let panel = NSSavePanel()
+            panel.title = "保存图表"
+            panel.allowedContentTypes = [DiagramFileService.documentType]
+            panel.nameFieldStringValue = document.displayName + ".hxdiagram"
+            guard panel.runModal() == .OK else { return false }
+            destination = panel.url
+        }
+        guard let destination else { return false }
+        do {
+            try DiagramFileService.write(document.data, to: destination)
+            document.markSaved(at: destination)
+            return true
+        } catch {
+            NSAlert(error: error).runModal()
+            return false
+        }
     }
 }
 
@@ -247,6 +306,8 @@ private struct QRCodeResultWindowView: View {
 private struct UtilityToolRootView: View {
     let tool: UtilityTool
     @ObservedObject var markdownOpenRouter: MarkdownOpenRouter
+    @ObservedObject var diagramOpenRouter: DiagramOpenRouter
+    let diagramDocument: DiagramDocumentModel?
     let colorPickerModel: ColorPickerToolModel?
 
     @ViewBuilder
@@ -261,6 +322,10 @@ private struct UtilityToolRootView: View {
             }
         case .password: PasswordToolView()
         case .markdown: MarkdownToolView(openRouter: markdownOpenRouter)
+        case .mindMap:
+            if let diagramDocument {
+                MindMapToolView(openRouter: diagramOpenRouter, document: diagramDocument)
+            }
         }
     }
 }

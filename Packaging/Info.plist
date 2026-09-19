@@ -28,6 +28,22 @@
 				<string>net.daringfireball.markdown</string>
 			</array>
 		</dict>
+		<dict>
+			<key>CFBundleTypeExtensions</key>
+			<array>
+				<string>hxdiagram</string>
+			</array>
+			<key>CFBundleTypeName</key>
+			<string>HelloX 图表</string>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>LSHandlerRank</key>
+			<string>Owner</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>com.hellox.diagram</string>
+			</array>
+		</dict>
 	</array>
 	<key>CFBundleExecutable</key>
 	<string>HelloX</string>
@@ -42,9 +58,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0.5</string>
+	<string>1.0.6</string>
 	<key>CFBundleVersion</key>
-	<string>98</string>
+	<string>103</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>15.0</string>
 	<key>LSUIElement</key>
@@ -77,6 +93,26 @@
 				</array>
 				<key>public.mime-type</key>
 				<string>text/markdown</string>
+			</dict>
+		</dict>
+	</array>
+	<key>UTExportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.json</string>
+			</array>
+			<key>UTTypeDescription</key>
+			<string>HelloX 图表文档</string>
+			<key>UTTypeIdentifier</key>
+			<string>com.hellox.diagram</string>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<string>hxdiagram</string>
+				<key>public.mime-type</key>
+				<string>application/vnd.hellox.diagram+json</string>
 			</dict>
 		</dict>
 	</array>

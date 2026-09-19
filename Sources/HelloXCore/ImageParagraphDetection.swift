@@ -279,9 +279,17 @@ public enum OCRSemanticContinuity {
         }
 
         if beginsWithUppercaseLatin(rhs), !endsWithConnector(lhs) { score -= 1 }
-        if lexicalLength(lhs) <= 10, lexicalLength(rhs) <= 10,
+        if isCompactLabel(lhs), isCompactLabel(rhs),
            !beginsWithContinuation(rhs) { score -= 1 }
         return score >= 2
+    }
+
+    /// Menu labels can contain several short words (including unit formulas).
+    /// Their missing punctuation alone is not evidence of sentence continuity.
+    static func isCompactLabel(_ text: String) -> Bool {
+        text.count <= 32
+            && text.split(whereSeparator: { $0.isWhitespace }).count <= 6
+            && text.last.map { !".!?;:。！？；：".contains($0) } == true
     }
 
     /// A greeting is a complete discourse unit even though it commonly ends
@@ -348,10 +356,6 @@ public enum OCRSemanticContinuity {
         let recognizer = NLLanguageRecognizer()
         recognizer.processString(text)
         return recognizer.dominantLanguage
-    }
-
-    private static func lexicalLength(_ text: String) -> Int {
-        text.filter { $0.isLetter || $0.isNumber }.count
     }
 
     private static func isStructuredLine(_ text: String) -> Bool {
@@ -477,8 +481,9 @@ public enum TextParagraphCorrector {
         // sidebar-only crop that spacing becomes the document's "normal" gap,
         // so the relative paragraph-gap threshold alone joins unrelated items.
         let independentLabels = left.blocks.count == 1 && right.blocks.count == 1
-            && isCompactLabel(leftText) && isCompactLabel(rightText)
-            && alignedLeftEdge && gapRatio > 0.45
+            && OCRSemanticContinuity.isCompactLabel(leftText)
+            && OCRSemanticContinuity.isCompactLabel(rightText)
+            && alignedLeftEdge && gapRatio > 0.35
             && !semanticallyContinuous
         if independentLabels { return true }
         let compactTitleWithSupportingCopy = leftText.count <= 32
@@ -547,12 +552,6 @@ public enum TextParagraphCorrector {
 
     private static func horizontalGap(_ lhs: CGRect, _ rhs: CGRect) -> CGFloat {
         max(lhs.minX, rhs.minX) - min(lhs.maxX, rhs.maxX)
-    }
-
-    private static func isCompactLabel(_ text: String) -> Bool {
-        text.count <= 32
-            && text.split(whereSeparator: { $0.isWhitespace }).count <= 3
-            && !endsSentence(text)
     }
 
     private static func isPlausibleInlineGap(
